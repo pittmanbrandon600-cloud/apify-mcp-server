@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
     buildStartRunResponse,
+    buildStartRunWidgetResponse,
     buildStatusSummaryNextStep,
     collapseArrayIndices,
     type RunDataset,
@@ -373,7 +374,7 @@ describe('get-actor-run default response', () => {
 
         const result = await (getActorRun as HelperTool).call({
             ...stubToolCallContext({ runId: 'run-1', waitSecs: 0 }, client),
-            extra: { signal: controller.signal } as InternalToolArgs['extra'],
+            signal: controller.signal,
         });
 
         // Cancelled requests return no payload per MCP spec — see `getActorRun`.
@@ -561,6 +562,7 @@ describe('get-actor-run default response', () => {
             stop: () => {
                 stopCount += 1;
             },
+            setRunId: () => {},
         };
 
         const baseArgs = stubToolCallContext({ runId: 'run-1', waitSecs: 5 }, client);
@@ -647,16 +649,18 @@ describe('get-actor-run default response', () => {
 // buildStartRunResponse — the "fire and forget" (waitSecs=0) response builder
 // -----------------------------------------------------------------------------
 
-describe('buildStartRunResponse()', () => {
-    const actorRun = {
-        id: 'run-abc',
-        actId: 'actor-xyz',
-        status: 'RUNNING',
-        startedAt: new Date('2026-01-02T03:04:05.000Z'),
-        defaultDatasetId: 'dataset-abc',
-        defaultKeyValueStoreId: 'kv-abc',
-    } as unknown as ActorRun;
+// Shared by buildStartRunResponse() and buildStartRunWidgetResponse() below — both builders
+// consume the same ActorRun shape.
+const actorRun = {
+    id: 'run-abc',
+    actId: 'actor-xyz',
+    status: 'RUNNING',
+    startedAt: new Date('2026-01-02T03:04:05.000Z'),
+    defaultDatasetId: 'dataset-abc',
+    defaultKeyValueStoreId: 'kv-abc',
+} as unknown as ActorRun;
 
+describe('buildStartRunResponse()', () => {
     it('builds correct RunResponse shape without widget metadata', () => {
         const result = buildStartRunResponse({ actorName: 'apify/rag-web-browser', actorRun });
 
@@ -730,12 +734,13 @@ describe('buildStartRunResponse()', () => {
         expect(content[1].text).toContain('Apify Console: run https://console.apify.com/actors/runs/run-abc');
         expect(content[1].text).toContain(VERBATIM_LINKS_NUDGE);
     });
+});
 
-    it('includes widget metadata and no-poll nextStep when widget=true', () => {
-        const result = buildStartRunResponse({
+describe('buildStartRunWidgetResponse()', () => {
+    it('includes widget metadata and a no-poll nextStep', () => {
+        const result = buildStartRunWidgetResponse({
             actorName: 'apify/rag-web-browser',
             actorRun,
-            widget: true,
         });
 
         const { structuredContent, _meta } = result as {
@@ -831,10 +836,15 @@ describe('buildStatusTemplate', () => {
             dataset: datasetEmpty,
             keyValueStore: kvWithRecords,
         });
-        expect(t.summary).toContain('No dataset items found');
+        // The count is unverified-zero (it can lag past the probe window), so the summary must
+        // not state "no items" as a conclusion - agents quote the summary and give up on it.
+        expect(t.summary).toContain('Dataset item count reads 0');
+        expect(t.summary).toContain('can lag');
+        expect(t.summary).not.toContain('No dataset items found');
         expect(t.summary).toContain('Key-value store has 2 keys');
         expect(t.nextStep).toContain('get-dataset-items');
         expect(t.nextStep).toContain('datasetId=ds-1');
+        expect(t.nextStep).toContain('before concluding');
         expect(t.nextStep).not.toContain('get-key-value-store-record');
     });
 
@@ -857,6 +867,26 @@ describe('buildStatusTemplate', () => {
         expect(t.nextStep).not.toContain('get-key-value-store-record');
     });
 
+    it('SUCCEEDED with a KV store holding only the INPUT record omits the KV suffix', () => {
+        const inputOnlyKv: RunKeyValueStore = { id: 'kv-1', keys: ['INPUT'], keyCount: 1 };
+        const t = buildStatusSummaryNextStep({
+            run: makeRun('SUCCEEDED'),
+            dataset: datasetWithItems,
+            keyValueStore: inputOnlyKv,
+        });
+        expect(t.summary).not.toContain('Key-value store');
+    });
+
+    it('SUCCEEDED does not count the INPUT record among KV keys', () => {
+        const kvWithInput: RunKeyValueStore = { id: 'kv-1', keys: ['INPUT', 'OUTPUT'], keyCount: 2 };
+        const t = buildStatusSummaryNextStep({
+            run: makeRun('SUCCEEDED'),
+            dataset: datasetWithItems,
+            keyValueStore: kvWithInput,
+        });
+        expect(t.summary).toContain('Key-value store has 1 key');
+    });
+
     it('SUCCEEDED with truncated key-value store reports partial count, not exact 50', () => {
         const truncatedKv: RunKeyValueStore = {
             id: 'kv-1',
@@ -870,6 +900,22 @@ describe('buildStatusTemplate', () => {
         });
         expect(t.summary).toContain('at least 50 keys');
         expect(t.summary).not.toMatch(/\(50 keys\)/);
+    });
+
+    it('SUCCEEDED with a truncated key-value store containing INPUT floors the count at 49, not 50', () => {
+        const truncatedKvWithInput: RunKeyValueStore = {
+            id: 'kv-1',
+            keys: ['INPUT', ...Array.from({ length: 49 }, (_, i) => `k-${i}`)],
+            // keyCount intentionally omitted — buildKeyValueStoreBlock omits it on truncation.
+        };
+        const t = buildStatusSummaryNextStep({
+            run: makeRun('SUCCEEDED'),
+            dataset: datasetEmpty,
+            keyValueStore: truncatedKvWithInput,
+        });
+        // Only 49 of the 50 fetched keys are real output; INPUT must not inflate the floor.
+        expect(t.summary).toContain('at least 49 keys');
+        expect(t.summary).not.toContain('at least 50 keys');
     });
 
     it('TIMED-OUT with dataset routes to partial-output nextStep', () => {

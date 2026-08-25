@@ -1,11 +1,10 @@
 import { z } from 'zod';
 
-import { ApifyClient } from '../../apify_client.js';
 import { HELPER_TOOLS } from '../../const.js';
 import type { InternalToolArgs, ToolEntry, ToolInputSchema } from '../../types.js';
 import { TOOL_TYPE } from '../../types.js';
 import { compileSchema } from '../../utils/ajv.js';
-import { encodeToon } from '../../utils/encode_text.js';
+import { respondRaw } from '../../utils/mcp.js';
 import { actorRunListOutputSchema } from '../structured_output_schemas.js';
 
 const getUserRunsListArgs = z.object({
@@ -38,7 +37,7 @@ export const getActorRunList: ToolEntry = Object.freeze({
     name: HELPER_TOOLS.ACTOR_RUN_LIST_GET,
     title: 'Get user runs list',
     description: `List Actor runs for the authenticated user with optional filtering and sorting.
-The results will include run details (including datasetId and keyValueStoreId) and can be filtered by status.
+The results will include run details (including defaultDatasetId and defaultKeyValueStoreId) and can be filtered by status.
 Valid statuses: READY (not allocated), RUNNING (executing), SUCCEEDED (finished), FAILED (failed), TIMING-OUT, TIMED-OUT, ABORTING, ABORTED.
 
 USAGE:
@@ -58,12 +57,14 @@ USAGE EXAMPLES:
         openWorldHint: false,
     },
     call: async (toolArgs: InternalToolArgs) => {
-        const { args, apifyToken } = toolArgs;
+        const { args, apifyClient } = toolArgs;
         const parsed = getUserRunsListArgs.parse(args);
-        const client = new ApifyClient({ token: apifyToken });
-        const runs = await client
+        const runs = await apifyClient
             .runs()
             .list({ limit: parsed.limit, offset: parsed.offset, desc: parsed.desc, status: parsed.status });
-        return { content: [{ type: 'text', text: encodeToon(runs) }], structuredContent: runs };
+        return respondRaw({
+            content: [{ type: 'text', text: JSON.stringify(runs) }],
+            structuredContent: runs as unknown as Record<string, unknown>,
+        });
     },
 } as const);

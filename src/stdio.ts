@@ -38,19 +38,14 @@ import { getTelemetryEnv } from './telemetry.js';
 import type { ApifyRequestParams, Input, ServerModeOption, TelemetryEnv, ToolSelector } from './types.js';
 import { isApiTokenRequired } from './utils/auth.js';
 import { parseCommaSeparatedList } from './utils/generic.js';
+import { injectMcpSessionId } from './utils/mcp.js';
 import { parseServerMode } from './utils/server_mode.js';
 import { getPackageVersion } from './utils/version.js';
 
 // Keeping this type here and not types.ts since
 // it is only relevant to the CLI/STDIO transport in this file
-/**
- * Type for command line arguments
- */
 type CliArgs = {
     actors?: string;
-    enableAddingActors: boolean;
-    /** @deprecated */
-    enableActorAutoLoading: boolean;
     /** Tool categories to include */
     tools?: string;
     /** Enable or disable telemetry tracking (default: true) */
@@ -81,7 +76,6 @@ function getTokenFromAuthFile(): string | undefined {
     }
 }
 
-// Configure logging, set to ERROR
 log.setLevel(log.LEVELS.ERROR);
 const packageVersion = getPackageVersion() ?? '0.0.0';
 
@@ -96,24 +90,12 @@ const argv = yargs(hideBin(process.argv))
             'Comma-separated list of Actor full names to add to the server. Can also be set via ACTORS environment variable.',
         example: 'apify/google-search-scraper,apify/instagram-scraper',
     })
-    .option('enable-adding-actors', {
-        type: 'boolean',
-        default: false,
-        describe: `Enable dynamically adding Actors as tools based on user requests. Can also be set via ENABLE_ADDING_ACTORS environment variable.
-Deprecated: use tools add-actor instead.`,
-    })
-    .option('enableActorAutoLoading', {
-        type: 'boolean',
-        default: false,
-        hidden: true,
-        describe: 'Deprecated: Use tools add-actor instead.',
-    })
     .options('tools', {
         type: 'string',
-        describe: `Comma-separated list of tools to enable. Can be either a tool category, a specific tool, or an Apify Actor. For example: --tools actors,docs,apify/rag-web-browser. Can also be set via TOOLS environment variable.
+        describe: `Comma-separated list of tools to enable. Can be either a tool category, a specific tool, or an Apify Actor. For example: --tools actors,docs,apify/rag-web-browser,apify/web-fetch. Can also be set via TOOLS environment variable.
 
 For more details visit https://mcp.apify.com`,
-        example: 'actors,docs,apify/rag-web-browser',
+        example: 'actors,docs,apify/rag-web-browser,apify/web-fetch',
     })
     .option('telemetry-enabled', {
         type: 'boolean',
@@ -154,11 +136,7 @@ Only used when --telemetry-enabled is true`,
     .epilogue('For more information, visit https://mcp.apify.com or https://github.com/apify/apify-mcp-server')
     .parseSync() as CliArgs;
 
-// Respect either the new flag or the deprecated one
-const enableAddingActors = Boolean(argv.enableAddingActors || argv.enableActorAutoLoading);
-// Split actors argument, trim whitespace, and filter out empty strings
 const actorList = argv.actors !== undefined ? parseCommaSeparatedList(argv.actors) : undefined;
-// Split tools argument, trim whitespace, and filter out empty strings
 const toolCategoryKeys = argv.tools !== undefined ? parseCommaSeparatedList(argv.tools) : undefined;
 
 // Propagate log.error to console.error for easier debugging
@@ -177,7 +155,6 @@ const apifyToken = process.env.APIFY_TOKEN || getTokenFromAuthFile();
 const requiresAuthentication = isApiTokenRequired({
     toolCategoryKeys,
     actorList,
-    enableAddingActors,
 });
 
 // Validate environment
@@ -189,10 +166,10 @@ if (requiresAuthentication && !apifyToken) {
 async function main() {
     // Node.js version guard — surface a clear error instead of cryptic failures
     const [major] = process.versions.node.split('.').map(Number);
-    if (major < 20) {
+    if (major < 22) {
         // eslint-disable-next-line no-console
         console.error(
-            `Error: Apify MCP server requires Node.js 20 or later (you have ${process.version}).\n` +
+            `Error: Apify MCP server requires Node.js 22 or later (you have ${process.version}).\n` +
                 'Please update Node.js: https://nodejs.org',
         );
         process.exit(1);
@@ -212,7 +189,6 @@ async function main() {
     // Create an Input object from CLI arguments
     const input: Input = {
         actors: actorList,
-        enableAddingActors,
         tools: toolCategoryKeys as ToolSelector[],
     };
 
@@ -239,12 +215,7 @@ async function main() {
     transport.onmessage = (message) => {
         const msgRecord = message as Record<string, unknown>;
         // Inject session ID into all requests for task isolation and session tracking.
-        // CRITICAL: Always create params object if missing (some requests like listTasks/getTasks don't have params),
-        // otherwise mcpSessionId injection fails, breaking session isolation in multi-node setups.
-        const params = (msgRecord.params || {}) as ApifyRequestParams;
-        params._meta ??= {};
-        params._meta.mcpSessionId = mcpSessionId;
-        msgRecord.params = params;
+        msgRecord.params = injectMcpSessionId(msgRecord.params as ApifyRequestParams | undefined, mcpSessionId);
 
         sdkOnMessage?.(message);
     };

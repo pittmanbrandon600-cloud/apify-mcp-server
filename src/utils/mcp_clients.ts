@@ -1,23 +1,15 @@
-import type { InitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { mcpClients } from 'mcp-client-capabilities';
+import { REQUEST_ORIGIN } from '../apify_client.js';
+import { APIFY_AI_CLIENT_NAME, REPORT_PROBLEM_BLOCKED_CLIENTS } from '../const.js';
+import type { McpClientContext } from '../mcp/client_context.js';
 
-/**
- * Determines if the MCP client supports dynamic tools based on the InitializeRequest data.
- */
-export function doesMcpClientSupportDynamicTools(initializeRequestData?: InitializeRequest): boolean {
-    const clientName = initializeRequestData?.params?.clientInfo?.name;
-    const clientCapabilities = mcpClients[clientName || ''];
-    if (!clientCapabilities) return false;
+/** True when `report-problem` is blocklisted for the connecting client (substring match on {@link REPORT_PROBLEM_BLOCKED_CLIENTS}). */
+export function isReportProblemBlockedForClient(context: McpClientContext | undefined): boolean {
+    const clientName = context?.clientInfo?.name?.toLowerCase() ?? '';
+    return REPORT_PROBLEM_BLOCKED_CLIENTS.some((blocked) => clientName.includes(blocked));
+}
 
-    const clientProtocolVersion = clientCapabilities.protocolVersion;
-    const knownProtocolVersion = initializeRequestData?.params?.protocolVersion;
-
-    // Compare the protocolVersion to check if the client is up to date
-    // We check for strict equality because if the versions differ, we cannot be sure about the capabilities
-    if (clientProtocolVersion !== knownProtocolVersion) {
-        // Client version is different from the known version, we cannot be sure about its capabilities
-        return false;
-    }
-
-    return clientCapabilities.tools?.listChanged === true;
+/** Apify API request origin for this client. Exact match on {@link APIFY_AI_CLIENT_NAME}; everything else is MCP. */
+export function getRequestOriginForClient(context: McpClientContext | undefined): REQUEST_ORIGIN {
+    const clientName = context?.clientInfo?.name;
+    return clientName === APIFY_AI_CLIENT_NAME ? REQUEST_ORIGIN.APIFY_AI : REQUEST_ORIGIN.MCP;
 }

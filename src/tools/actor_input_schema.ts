@@ -1,7 +1,13 @@
 import type { ValidateFunction } from 'ajv';
 import type Ajv from 'ajv';
 
-import { ACTOR_ENUM_MAX_LENGTH, ACTOR_MAX_DESCRIPTION_LENGTH, RAG_WEB_BROWSER_WHITELISTED_FIELDS } from '../const.js';
+import {
+    ACTOR_ENUM_MAX_LENGTH,
+    ACTOR_MAX_DESCRIPTION_LENGTH,
+    RAG_WEB_BROWSER_WHITELISTED_FIELDS,
+    WEB_FETCH,
+    WEB_FETCH_URL_SCHEME_NOTE,
+} from '../const.js';
 import { SchemaTooLargeError } from '../errors.js';
 import type { ActorInputSchema, SchemaProperties } from '../types.js';
 import {
@@ -47,15 +53,10 @@ export function fixedAjvCompile(ajvInstance: Ajv, schema: object): ValidateFunct
 }
 
 /**
- * Builds nested properties for object types in the schema.
- *
- * Specifically handles special cases like proxy configuration and request list sources
- * by adding predefined nested properties to these object types.
- * This is necessary for the agent to correctly infer how to structure object inputs
- * when passing arguments to the Actor.
- *
- * For proxy objects (type='object', editor='proxy'), adds 'useApifyProxy' property.
- * For request list sources (type='array', editor='requestListSources'), adds URL structure to items.
+ * Adds predefined nested properties to special-case object types so the agent can structure
+ * object inputs correctly:
+ * - proxy objects (type='object', editor='proxy') get a 'useApifyProxy' property.
+ * - request list sources (type='array', editor='requestListSources') get URL structure on items.
  *
  * @param {Record<string, SchemaProperties>} properties - The input schema properties
  * @returns {Record<string, SchemaProperties>} Modified properties with nested properties
@@ -88,11 +89,8 @@ export function buildApifySpecificProperties(
  * Filters schema properties to include only the necessary fields.
  * This is done to reduce the size of the input schema and to make it more readable.
  *
- * TODO(#675): This object literal unconditionally assigns every whitelisted key,
- * including `default: undefined`, on properties that didn't declare them upstream.
- * This creates phantom keys that broke `fixZodSchemaRequired()` via key-presence
- * checks (#637). The symptom is patched in `src/utils/ajv.ts` (value-check), but
- * this function should only emit keys whose upstream value is not `undefined`.
+ * Only copies a whitelisted key when the upstream property actually declares it, so
+ * unset fields (e.g. no `default`) aren't turned into phantom `default: undefined` keys.
  *
  * @param properties
  */
@@ -104,13 +102,13 @@ export function filterSchemaProperties(properties: { [key: string]: SchemaProper
         filteredProperties[key] = {
             title: property.title,
             description: property.description,
-            enum: property.enum,
             type: property.type,
-            default: property.default,
-            prefill: property.prefill,
-            properties: property.properties,
-            items: property.items,
-            required: property.required,
+            ...(property.enum !== undefined && { enum: property.enum }),
+            ...(property.default !== undefined && { default: property.default }),
+            ...(property.prefill !== undefined && { prefill: property.prefill }),
+            ...(property.properties !== undefined && { properties: property.properties }),
+            ...(property.items !== undefined && { items: property.items }),
+            ...(property.required !== undefined && { required: property.required }),
         };
     }
     return filteredProperties;
@@ -143,9 +141,8 @@ export function inferArrayItemsTypeIfMissing(properties: { [key: string]: Schema
  * Marks input properties as required by adding a "REQUIRED" prefix to their descriptions.
  * Takes an ActorInput object and returns a modified Record of SchemaProperties.
  *
- * This is done for maximum compatibility in case where library or agent framework does not consider
- * required fields and does not handle the JSON schema properly: we are prepending this to the description
- * as a preventive measure.
+ * Prepending to the description (rather than relying on the schema's `required` array) maximizes
+ * compatibility with libraries/agent frameworks that ignore or mishandle required fields.
  * @param {ActorInputSchema} input - Actor input object containing properties and required fields
  * @returns {Record<string, SchemaProperties>} - Modified properties with required fields marked
  */
@@ -208,6 +205,10 @@ export function buildActorInputSchema(actorFullName: string, input: ActorInputSc
         finalSchema = pruneSchemaPropertiesByWhitelist(finalSchema, RAG_WEB_BROWSER_WHITELISTED_FIELDS);
     }
 
+    if (actorFullName === WEB_FETCH && finalSchema.properties.url) {
+        finalSchema.properties.url.description += ` ${WEB_FETCH_URL_SCHEME_NOTE}`;
+    }
+
     finalSchema.$id = getToolSchemaID(actorFullName);
     return { inputSchema: finalSchema };
 }
@@ -240,11 +241,9 @@ export function pruneSchemaPropertiesByWhitelist(
 }
 
 /**
- * Helps determine the type of items in an array schema property.
+ * Determines the type of items in an array schema property, since Actor input schemas usually
+ * omit `items.type`.
  * Priority order: explicit type in items > prefill type > default value type > editor type.
- *
- * Based on JSON schema, the array needs a type, and most of the time Actor input schema does not have this, so we need to infer that.
- *
  */
 export function inferArrayItemType(property: SchemaProperties): string | null {
     return (
@@ -268,10 +267,8 @@ export function inferArrayItemType(property: SchemaProperties): string | null {
 }
 
 /**
- * Add enum values as string to property descriptions.
- *
- * This is done as a preventive measure to prevent cases where library or agent framework
- * does not handle enums or examples based on JSON schema definition.
+ * Add enum values as string to property descriptions, guarding against libraries/agent
+ * frameworks that don't handle enums or examples via JSON Schema annotations.
  *
  * https://json-schema.org/understanding-json-schema/reference/enum
  * https://json-schema.org/understanding-json-schema/reference/annotations

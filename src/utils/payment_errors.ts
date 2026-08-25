@@ -6,7 +6,7 @@ import type { ApifyClient } from '../apify_client.js';
 import { HTTP_PAYMENT_REQUIRED } from '../const.js';
 import { isActorRunLimitError } from './apify_errors.js';
 import { getHttpStatusCode } from './logging.js';
-import { buildMCPResponse } from './mcp.js';
+import { respondErrorNoTelemetry, type ToolResponse } from './mcp.js';
 
 const PAYMENT_REQUIRED_HEADER = 'payment-required';
 
@@ -121,5 +121,16 @@ export function buildPaymentRequiredResponse(errorOrMessage: unknown, precompute
         ? [JSON.stringify(paymentData), 'Payment required to run this Actor or access this resource.']
         : [message];
 
-    return buildMCPResponse({ texts, isError: true, structuredContent: paymentData });
+    return respondErrorNoTelemetry(texts, { structuredContent: paymentData });
+}
+
+/** Text lines for a permission-approval response: the error message plus an optional approval URL. */
+export function buildPermissionApprovalTexts(error: ApifyApiError): string[] {
+    const approvalUrl = typeof error.data?.approvalUrl === 'string' ? error.data.approvalUrl : undefined;
+    return [error.message, ...(approvalUrl ? [`Approve here: ${approvalUrl}`] : [])];
+}
+
+/** Exported for the shared tool-call error mapper (src/mcp/tool_call_error_mapper.ts) — no logging, no telemetry. */
+export function buildPermissionApprovalResponse(error: ApifyApiError): ToolResponse {
+    return respondErrorNoTelemetry(buildPermissionApprovalTexts(error));
 }

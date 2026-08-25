@@ -4,7 +4,7 @@ import { HELPER_TOOLS } from '../../const.js';
 import type { InternalToolArgs, ToolEntry, ToolInputSchema } from '../../types.js';
 import { TOOL_TYPE } from '../../types.js';
 import { compileSchema } from '../../utils/ajv.js';
-import { buildMCPResponse } from '../../utils/mcp.js';
+import { respondOk } from '../../utils/mcp.js';
 import { buildStats, buildStatusSummaryNextStep, type RunResponse, toIsoString } from '../actors/actor_run_response.js';
 import { actorRunOutputSchema } from '../structured_output_schemas.js';
 
@@ -24,7 +24,7 @@ export const abortActorRun: ToolEntry = Object.freeze({
     name: HELPER_TOOLS.ACTOR_RUNS_ABORT,
     title: 'Abort Actor run',
     description: `Abort an Actor run that is currently starting or running.
-For runs with status FINISHED, FAILED, ABORTING, or TIMED-OUT, this call has no effect.
+For runs with status SUCCEEDED, FAILED, ABORTING, ABORTED, or TIMED-OUT, this call has no effect.
 The results will include the updated run details after the abort request.
 
 USAGE:
@@ -51,7 +51,12 @@ USAGE EXAMPLES:
 
         const dataset = run.defaultDatasetId ? { id: run.defaultDatasetId } : undefined;
         const keyValueStore = run.defaultKeyValueStoreId ? { id: run.defaultKeyValueStoreId } : undefined;
-        const { summary, nextStep } = buildStatusSummaryNextStep({ run, dataset, keyValueStore });
+        const { summary, nextStep } = buildStatusSummaryNextStep({
+            run,
+            dataset,
+            keyValueStore,
+            datasetMetadataFetched: false,
+        });
 
         const structuredContent: RunResponse = {
             runId: run.id,
@@ -69,9 +74,6 @@ USAGE EXAMPLES:
             nextStep,
         };
 
-        return buildMCPResponse({
-            texts: [JSON.stringify(structuredContent), `${summary}\n${nextStep}`],
-            structuredContent,
-        });
+        return respondOk([JSON.stringify(structuredContent), `${summary}\n${nextStep}`], { structuredContent });
     },
 } as const);

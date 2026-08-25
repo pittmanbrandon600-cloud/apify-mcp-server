@@ -11,8 +11,7 @@ import { SERVER_MODE } from '../types.js';
 import { loadToolsFromInput } from '../utils/tools_loader.js';
 
 /**
- * Process input parameters from URL and get tools
- * If URL contains query parameter `actors`, return tools from Actors otherwise return null.
+ * If the URL contains an `actors` query parameter, returns tools for those Actors; otherwise null.
  * @param url The URL to process
  * @param apifyClient The Apify client instance
  * @param mode Server mode for tool variant resolution
@@ -30,8 +29,10 @@ export async function processParamsGetTools(
 
 export function parseInputParamsFromUrl(url: string): Input {
     const query = url.split('?')[1] || '';
-    const params = parse(query) as unknown as Input;
-    return processInput(params);
+    const params = parse(query);
+    delete params.enableAddingActors;
+    delete params.enableActorAutoLoading;
+    return processInput(params as unknown as Input);
 }
 
 /**
@@ -88,9 +89,22 @@ export async function isTaskCancelled(
  * is cancelled via `tasks/cancel`. Caller MUST invoke `dispose()` once the
  * tool handler returns or the polling interval leaks.
  *
- * See {@link ../../res/tasks_cancel_abort_flow.md} for the full design:
- * why the request's `extra.signal` is intentionally NOT chained, why polling
- * (not a callback), and how it composes with the existing handler-side abort.
+ * The SDK's `tasks/cancel` handler only writes `status='cancelled'` to the store — it does not
+ * abort the in-flight request's `AbortController`. Without this watcher the Actor run keeps
+ * consuming compute until it finishes naturally. The signal reaches `waitForRunWithProgress`,
+ * whose `raceAbort` invokes `abortRunOnSignal` → `apifyClient.run(runId).abort()`.
+ *
+ * Two deliberate choices:
+ *
+ * - **The request's `extra.signal` is NOT chained.** Per the tasks spec a task's lifetime is
+ *   decoupled from the request that created it: client disconnect, transport close, or
+ *   `notifications/cancelled` on the original request MUST NOT cancel the task. Only
+ *   `tasks/cancel` may. Regression guard: the `does not abort when an unrelated AbortSignal
+ *   fires` case in `tests/unit/mcp.utils.test.ts`.
+ * - **Polling, not a callback.** In multi-node deployments `tasks/cancel` can land on a
+ *   different pod than the one running the handler; the `AbortController` lives in that pod's
+ *   memory. The shared TaskStore is the only signal the executing pod can observe, so it must
+ *   poll. 500 ms trades cancel latency against store load.
  */
 export function createTaskCancellationWatcher(opts: {
     taskId: string;

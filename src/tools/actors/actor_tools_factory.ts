@@ -8,6 +8,8 @@ import {
     HELPER_TOOLS,
     RAG_WEB_BROWSER,
     RAG_WEB_BROWSER_ADDITIONAL_DESC,
+    WEB_FETCH,
+    WEB_FETCH_ADDITIONAL_DESC,
 } from '../../const.js';
 import { ActorLoadError } from '../../errors.js';
 import { getActorMCPServerPath, getActorMCPServerURL } from '../../mcp/actors.js';
@@ -84,14 +86,9 @@ export async function enrichActorToolOutputSchemas(tools: ToolEntry[], actorStor
 }
 
 /**
- * This function is used to fetch normal non-MCP server Actors as a tool.
- *
- * Fetches Actor input schemas by Actor IDs or Actor full names and creates MCP tools.
- *
- * This function retrieves the input schemas for the specified Actors and compiles them into MCP tools.
- * It uses the AJV library to validate the input schemas.
- *
- * Tool name can't contain /, so it is replaced with _
+ * Fetches input schemas for normal (non-MCP-server) Actors by ID or full name and compiles them
+ * into MCP tools, using AJV to validate the input schemas. Tool name can't contain /, so it is
+ * replaced with _.
  *
  * The input schema processing workflow:
  * 1. Properties are marked as required using markInputPropertiesAsRequired() to add "REQUIRED" prefix to descriptions
@@ -130,7 +127,9 @@ export async function getNormalActorsAsTools(
 Use this tool instead of the "${HELPER_TOOLS.ACTOR_CALL}" if user requests this specific Actor.
 Actor description: ${definition.description}`;
         if (isRag) {
-            description += RAG_WEB_BROWSER_ADDITIONAL_DESC;
+            description += `\n\n${RAG_WEB_BROWSER_ADDITIONAL_DESC}`;
+        } else if (definition.actorFullName === WEB_FETCH) {
+            description += `\n\n${WEB_FETCH_ADDITIONAL_DESC}`;
         }
 
         const memoryMbytes = Math.min(
@@ -192,10 +191,8 @@ export async function getMCPServersAsTools(
     apifyToken: ApifyToken,
     mcpSessionId?: string,
 ): Promise<ToolEntry[]> {
-    /**
-     * This is case for the payment provider request without any Apify token, we do not support
-     * standby Actors in this case, so we can skip MCP servers since they would fail anyway (they are standby Actors).
-     */
+    // Payment-provider request with no Apify token: standby Actors aren't supported here, so
+    // MCP servers — which are always standby Actors — are skipped since they'd fail anyway.
     if (apifyToken === null || apifyToken === undefined) {
         return [];
     }
@@ -232,7 +229,7 @@ export async function getMCPServersAsTools(
                 // Skip this Actor, connectMCPClient will log the error
                 return [];
             }
-            return await getMCPServerTools(actorId, client, mcpServerUrl);
+            return await getMCPServerTools(actorId, client, mcpServerUrl, actorInfo.definition.actorFullName);
         } catch (error) {
             logHttpError(error, 'Failed to load tools from MCP server', {
                 actorFullName: actorInfo.definition.actorFullName,
@@ -285,8 +282,8 @@ export function fixActorNameInput(actorName: string): string {
  * describing why the load failed.
  *
  * Bulk callers (`getActors`, server load-helpers) typically only read
- * `tools`. Single-Actor callers (`add-actor`, `call-actor`) read `errors[0]`
- * to surface the precise reason back to the agent.
+ * `tools`. The single-Actor caller (`call-actor`) reads `errors[0]` to surface
+ * the precise reason back to the agent.
  */
 export type ActorsAsToolsResult = {
     tools: ToolEntry[];
@@ -296,9 +293,9 @@ export type ActorsAsToolsResult = {
 /**
  * Loads Actor metadata + builds MCP tool entries for the requested Actor
  * names. Returns both successful tools and `ActorLoadError` entries so
- * callers can surface precise reasons when needed (single-Actor flows like
- * `add-actor` / `call-actor`) or just ignore failures (bulk session-boot
- * flows that build the initial tool surface).
+ * callers can surface precise reasons when needed (a single-Actor flow like
+ * `call-actor`) or just ignore failures (bulk session-boot flows that build
+ * the initial tool surface).
  *
  * When `paymentProvider` is set, standby and MCP-server Actors are reported
  * as `STANDBY_PAYMENT_NOT_SUPPORTED` errors instead of contributing tools.

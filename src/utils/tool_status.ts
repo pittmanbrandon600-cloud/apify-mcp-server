@@ -51,6 +51,14 @@ export function deriveResourceIds(args: Record<string, unknown> | undefined, res
 }
 
 /**
+ * Type predicate: true if `error` is an SDK `McpError`. Lets the shared orchestration modules
+ * keep the exact `instanceof McpError` behavior without importing the SDK error type themselves.
+ */
+export function isMcpError(error: unknown): error is McpError {
+    return error instanceof McpError;
+}
+
+/**
  * Central helper to classify an error into a ToolStatus value.
  *
  * - TOOL_STATUS.ABORTED   → the client explicitly aborted Request.
@@ -100,6 +108,39 @@ export function classifyFailureCategory(error: unknown): FailureCategory {
     if (statusCode !== undefined && statusCode >= 500) return FAILURE_CATEGORY.INTERNAL_ERROR;
 
     return FAILURE_CATEGORY.INTERNAL_ERROR;
+}
+
+/** Inputs for {@link buildExecutionDiagnostics}. */
+export type ExecutionDiagnosticsParams = {
+    error: unknown;
+    isAborted: boolean;
+    actorName: string | undefined;
+    actorId: string | undefined;
+};
+
+/**
+ * Builds the execution-arm telemetry shared by the generic mapper's EXECUTION branch and the
+ * ACTOR_MCP inner catch: the abort-aware `toolStatus`, plus `callDiagnostics` carrying
+ * `failure_category`, the conditional `failure_http_status`, the 200-char-truncated `failure_detail`,
+ * and the actor fields. Field set and order match the mapper's EXECUTION arm exactly. Callers add
+ * their own `userText`/`response` and do their own logging.
+ */
+export function buildExecutionDiagnostics(params: ExecutionDiagnosticsParams): {
+    toolStatus: ToolStatus;
+    callDiagnostics: CallDiagnostics;
+} {
+    const { error, isAborted, actorName, actorId } = params;
+    const httpStatus = getHttpStatusCode(error);
+    const failureDetail = error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200);
+    return {
+        toolStatus: getToolStatusFromError(error, isAborted),
+        callDiagnostics: {
+            failure_category: classifyFailureCategory(error),
+            ...(httpStatus !== undefined ? { failure_http_status: httpStatus } : {}),
+            failure_detail: failureDetail,
+            ...buildActorFields(actorName, actorId),
+        },
+    };
 }
 
 const MAX_VALIDATION_FIELD_LENGTH = 120;
@@ -166,7 +207,6 @@ export function extractToolTelemetry(
     const telemetry = res.toolTelemetry as ToolTelemetryContext | undefined;
     delete res.toolTelemetry;
 
-    // Tool-reported actorId (e.g. from call-actor) takes precedence over server-side actorId
     const actorFields = buildActorFields(actorName, telemetry?.actorId ?? actorId);
 
     if (!telemetry) {
@@ -190,4 +230,20 @@ export function extractToolTelemetry(
     };
 
     return { toolStatus, callDiagnostics };
+}
+
+/**
+ * Folds a tool result's embedded telemetry onto the caller's running toolStatus/callDiagnostics.
+ * Thin wrapper over {@link extractToolTelemetry} so every dispatch branch (sync/task × internal/actor)
+ * shares one call instead of repeating the extract-then-merge. `extractToolTelemetry` strips
+ * `toolTelemetry` from `res` in place, so the caller keeps using that same (now clean) object.
+ */
+export function applyToolTelemetry(
+    res: Record<string, unknown>,
+    actorName: string | undefined,
+    actorId: string | undefined,
+    prevDiagnostics: CallDiagnostics,
+): { toolStatus: ToolStatus; callDiagnostics: CallDiagnostics } {
+    const diag = extractToolTelemetry(res, actorName, actorId);
+    return { toolStatus: diag.toolStatus, callDiagnostics: { ...prevDiagnostics, ...diag.callDiagnostics } };
 }

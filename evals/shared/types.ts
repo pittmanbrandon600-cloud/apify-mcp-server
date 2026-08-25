@@ -35,17 +35,6 @@ export type ToolSelectionTestCase = {
 } & BaseTestCase;
 
 /**
- * Test case for workflow evaluation (multi-turn agent conversations)
- * Used in: evals/workflows/
- */
-export type WorkflowTestCase = {
-    /** Maximum number of turns allowed (optional, defaults to config value) */
-    maxTurns?: number;
-    /** Tools to enable for this test (optional, e.g., ["actors", "docs", "apify/rag-web-browser"]) */
-    tools?: string[];
-} & BaseTestCase;
-
-/**
  * Test data structure wrapping test cases with version
  */
 export type TestData = {

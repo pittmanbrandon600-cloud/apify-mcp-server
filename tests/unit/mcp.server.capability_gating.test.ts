@@ -11,8 +11,18 @@ import { searchActors } from '../../src/tools/actors/search_actors.js';
 import { searchActorsWidget } from '../../src/tools/widgets/search_actors_widget.js';
 import type { ServerModeOption } from '../../src/types.js';
 import { SERVER_MODE } from '../../src/types.js';
+import type * as ToolsLoaderModule from '../../src/utils/tools_loader.js';
+import { getActors } from '../../src/utils/tools_loader.js';
+import { getRequestHandler } from './helpers/mcp_server.js';
 
-type InitHandler = (req: InitializeRequest, ctx: unknown) => Promise<unknown>;
+// Stub getActors so tests can produce a non-empty actorTools array without a network
+// fetch to the Apify platform. getToolsForServerMode / toolNamesToInput stay real.
+vi.mock('../../src/utils/tools_loader.js', async (importOriginal) => {
+    const actual = await importOriginal<typeof ToolsLoaderModule>();
+    return { ...actual, getActors: vi.fn() };
+});
+
+const getActorsMock = vi.mocked(getActors);
 
 function makeInitializeRequest(supportsUi: boolean): InitializeRequest {
     const extensions = supportsUi ? { 'io.modelcontextprotocol/ui': { mimeTypes: [RESOURCE_MIME_TYPE] } } : {};
@@ -40,18 +50,15 @@ function makeServer(serverMode: ServerModeOption): ActorsMcpServer {
  * transport layer). Mirrors what the SDK does when a real client sends `initialize`.
  */
 async function dispatchInitialize(server: ActorsMcpServer, request: InitializeRequest): Promise<void> {
-    // eslint-disable-next-line no-underscore-dangle
-    const handler = (
-        server.server as unknown as {
-            _requestHandlers: Map<string, InitHandler>;
-        }
-    )._requestHandlers.get('initialize');
-    if (!handler) throw new Error('initialize handler not registered');
-    await handler(request, {});
+    await getRequestHandler(server, 'initialize')(request as unknown as Record<string, unknown>, {});
 }
 
 describe('ActorsMcpServer initialize handler', () => {
     const servers: ActorsMcpServer[] = [];
+
+    // Default: no actor tools resolved, matching the real getActors() behavior for
+    // inputs that only reference HELPER_TOOLS names (used by the pre-existing tests below).
+    getActorsMock.mockResolvedValue([]);
 
     afterEach(async () => {
         while (servers.length > 0) {
@@ -59,6 +66,8 @@ describe('ActorsMcpServer initialize handler', () => {
             server?.tools.clear();
             await server?.close();
         }
+        getActorsMock.mockReset();
+        getActorsMock.mockResolvedValue([]);
     });
 
     const track = (server: ActorsMcpServer): ActorsMcpServer => {
@@ -165,13 +174,9 @@ describe('ActorsMcpServer initialize handler', () => {
         async () => {
             const server = track(makeServer('auto'));
             const apifyClient = new ApifyClient({ token: 'test-token' });
-            const loadActorsAsTools = vi
-                .spyOn(server, 'loadActorsAsTools')
-                .mockResolvedValue({ tools: [], errors: [] });
 
             await server.loadToolsByName([HELPER_TOOLS.STORE_SEARCH_WIDGET], apifyClient);
 
-            expect(loadActorsAsTools).not.toHaveBeenCalled();
             expect(server.tools.has(HELPER_TOOLS.STORE_SEARCH_WIDGET)).toBe(false);
 
             await dispatchInitialize(server, makeInitializeRequest(true));

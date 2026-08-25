@@ -1,9 +1,40 @@
-import type { ToolCallTelemetryProperties, ToolTelemetryContext } from '../types.js';
-import { ACTOR_RUN_LIMIT_MESSAGE, isActorRunLimitError } from './apify_errors.js';
+import type { CallToolResult, ContentBlock } from '@modelcontextprotocol/sdk/types.js';
+
+import { FAILURE_CATEGORY, TOOL_STATUS } from '../const.js';
+import type {
+    AjvErrorDetails,
+    ApifyRequestParams,
+    FailureCategory,
+    ToolInputSchema,
+    ToolTelemetryContext,
+} from '../types.js';
+import {
+    ACTOR_RUN_LIMIT_MESSAGE,
+    getApifyErrorType,
+    isActorRunLimitError,
+    isCannotPublishTaskError,
+} from './apify_errors.js';
+import { wrapJsonText } from './encode_text.js';
 import { getHttpStatusCode } from './logging.js';
+import { classifyFailureCategory, getToolStatusFromError } from './tool_status.js';
 
 /** MCP `_meta` key for Apify Actor run information. Namespaced per MCP spec. */
 export const APIFY_ACTOR_RUN_META_KEY = 'com.apify/ActorRun';
+
+/**
+ * Injects the MCP session ID into request parameters.
+ * Always ensures a params object exists, even for requests that normally have no params (e.g., listTasks/getTasks),
+ * otherwise mcpSessionId injection fails, breaking session isolation in multi-node setups.
+ * @param params Request parameters (may be undefined)
+ * @param mcpSessionId Session ID to inject
+ * @returns Params object with _meta.mcpSessionId set
+ */
+export function injectMcpSessionId(params: ApifyRequestParams | undefined, mcpSessionId: string): ApifyRequestParams {
+    const result = (params || {}) as ApifyRequestParams;
+    result._meta ??= {};
+    result._meta.mcpSessionId = mcpSessionId;
+    return result;
+}
 
 /**
  * Builds usage metadata for MCP response from a source object containing Apify run costs.
@@ -32,7 +63,7 @@ export function buildUsageMeta(source: {
  *   then stripped by `extractToolTelemetry()` before the response reaches the client.
  *   Contains tool outcome (toolStatus, failureCategory, etc.) used for Segment telemetry.
  */
-export function buildMCPResponse(options: {
+function buildMCPResponse(options: {
     texts: string[];
     isError?: boolean;
     telemetry?: ToolTelemetryContext;
@@ -47,7 +78,158 @@ export function buildMCPResponse(options: {
         ...(telemetry && { toolTelemetry: telemetry }),
         ...(structuredContent !== undefined && { structuredContent }),
         ...(_meta !== undefined && { _meta }),
-    };
+    } as unknown as ToolResponse;
+}
+
+/**
+ * Module-private brand. Phantom `declare`d symbol — never assigned or emitted at runtime, so it adds
+ * nothing to the wire. Its only job is to make `ToolResponse` unforgeable at compile time.
+ */
+declare const toolResponseBrand: unique symbol;
+
+/**
+ * Shared return type of the `respond*` constructors and of every `HelperTool.call`. The required brand
+ * means a raw `{ content, isError }` literal (or a bare `{}`) fails to compile — the only way to produce a
+ * `ToolResponse` is a constructor here. `content` is the full MCP `ContentBlock` union so image/audio/
+ * resource returns type-check.
+ *
+ * `content` and `isError` are optional because the escape hatches may omit them: `respondAborted()`
+ * returns `{}` (both absent) and `respondRaw()` passes a `CallToolResult` through unchanged (which may
+ * omit `isError`). Consumers reading either field must guard (`?.`, an `in` check, or the `textOf` helper).
+ */
+export type ToolResponse = {
+    content?: ContentBlock[];
+    isError?: boolean;
+    toolTelemetry?: ToolTelemetryContext;
+    structuredContent?: unknown;
+    _meta?: Record<string, unknown>;
+} & { readonly [toolResponseBrand]: never };
+
+/** Normalise a `string | string[]` text argument to the array `buildMCPResponse` expects. */
+function toTexts(texts: string | string[]): string[] {
+    return Array.isArray(texts) ? texts : [texts];
+}
+
+/**
+ * Success response carrying caller-supplied text. `content[0]` is the raw text verbatim — bare JSON
+ * stays bare (the raw-JSON mirror channel), so use this (not `respondJson`) for unfenced JSON payloads.
+ */
+export function respondOk(
+    texts: string | string[],
+    opts?: { structuredContent?: unknown; meta?: Record<string, unknown> },
+): ToolResponse {
+    return buildMCPResponse({
+        texts: toTexts(texts),
+        structuredContent: opts?.structuredContent,
+        _meta: opts?.meta,
+    });
+}
+
+/**
+ * Success response carrying a JSON value in a ```json code fence. Owns the fence by delegating to
+ * `wrapJsonText` — use only where the byte output already leads with a ```json fence.
+ */
+export function respondJson(
+    value: unknown,
+    opts?: { structuredContent?: unknown; meta?: Record<string, unknown> },
+): ToolResponse {
+    return buildMCPResponse({
+        texts: [wrapJsonText(value)],
+        structuredContent: opts?.structuredContent,
+        _meta: opts?.meta,
+    });
+}
+
+/**
+ * User-error response (`SOFT_FAIL`). `category` defaults to `INVALID_INPUT`; the type excludes
+ * `INTERNAL_ERROR` (a server category — use `respondServerError` for that).
+ */
+export function respondUserError(
+    texts: string | string[],
+    opts?: {
+        category?: Exclude<FailureCategory, 'INTERNAL_ERROR'>;
+        httpStatus?: number;
+        detail?: string;
+        actorId?: string;
+        ajvErrorDetails?: AjvErrorDetails;
+        structuredContent?: unknown;
+    },
+): ToolResponse {
+    return buildMCPResponse({
+        texts: toTexts(texts),
+        isError: true,
+        telemetry: {
+            toolStatus: TOOL_STATUS.SOFT_FAIL,
+            failureCategory: opts?.category ?? FAILURE_CATEGORY.INVALID_INPUT,
+            ...(opts?.httpStatus !== undefined && { failureHttpStatus: opts.httpStatus }),
+            ...(opts?.detail !== undefined && { failureDetail: opts.detail }),
+            ...(opts?.actorId !== undefined && { actorId: opts.actorId }),
+            ...(opts?.ajvErrorDetails !== undefined && { ajvErrorDetails: opts.ajvErrorDetails }),
+        },
+        structuredContent: opts?.structuredContent,
+    });
+}
+
+/**
+ * Server-error response. Derives `toolStatus`/`failureCategory`/`failureHttpStatus` from the caught
+ * error (so a 4xx yields `SOFT_FAIL`, not `FAILED`); with no error → `FAILED` + `INTERNAL_ERROR`.
+ */
+export function respondServerError(
+    texts: string | string[],
+    opts?: {
+        error?: unknown;
+        detail?: string;
+        actorId?: string;
+        structuredContent?: unknown;
+        meta?: Record<string, unknown>;
+    },
+): ToolResponse {
+    const { error } = opts ?? {};
+    const httpStatus = getHttpStatusCode(error);
+    return buildMCPResponse({
+        texts: toTexts(texts),
+        isError: true,
+        telemetry: {
+            toolStatus: error === undefined ? TOOL_STATUS.FAILED : getToolStatusFromError(error, false),
+            failureCategory: error === undefined ? FAILURE_CATEGORY.INTERNAL_ERROR : classifyFailureCategory(error),
+            ...(httpStatus !== undefined && { failureHttpStatus: httpStatus }),
+            ...(opts?.detail !== undefined && { failureDetail: opts.detail }),
+            ...(opts?.actorId !== undefined && { actorId: opts.actorId }),
+        },
+        structuredContent: opts?.structuredContent,
+        _meta: opts?.meta,
+    });
+}
+
+/**
+ * Error response for framework paths (native-tool handling and the outer catch in `server.ts`, the
+ * x402 path) that record telemetry on local vars and bypass `extractToolTelemetry`. Carries no
+ * `toolTelemetry` key, so nothing leaks onto the wire. Tool handlers must NOT use this — they return
+ * a `respond*` error so telemetry is attached and then stripped by `extractToolTelemetry`.
+ */
+export function respondErrorNoTelemetry(
+    texts: string | string[],
+    opts?: { structuredContent?: unknown },
+): ToolResponse {
+    return { ...respondOk(texts, opts), isError: true };
+}
+
+/**
+ * Brands an already-well-formed MCP result without reshaping it — runtime identity. For content this
+ * module can't build: binary/resource blocks (image, audio, resource_link, embedded resource) and opaque
+ * remote tool results. Returns the exact object passed in (no `isError` injection, no key reorder), so the
+ * wire bytes stay identical.
+ */
+export function respondRaw(result: CallToolResult): ToolResponse {
+    return result as unknown as ToolResponse;
+}
+
+/**
+ * Empty response for MCP cancellation paths — per spec, receivers SHOULD NOT reply to a cancelled request.
+ * Returns runtime `{}`, branded.
+ */
+export function respondAborted(): ToolResponse {
+    return {} as unknown as ToolResponse;
 }
 
 /**
@@ -100,37 +282,45 @@ export function computeToolResponseBytes(result: unknown): {
 }
 
 /**
- * Maps computed response byte counts to their `tool_response_*_bytes` telemetry fields.
- * Single source of truth for the field set, so adding a byte metric touches only
- * `computeToolResponseBytes` and this mapping. Returns `{}` when bytes weren't computed
- * (e.g. telemetry-disabled path) so callers can spread it unconditionally.
+ * Actionable hint for an HTTP failure status, or `undefined` when the status carries no specific
+ * remedy. Shared by the tool-call and resources/read error paths so both differentiate auth failures
+ * the same way (the model's only lever is the text it gets back).
  */
-export function buildResponseBytesTelemetry(
-    responseBytes?: ReturnType<typeof computeToolResponseBytes>,
-): Pick<
-    ToolCallTelemetryProperties,
-    'tool_response_content_bytes' | 'tool_response_structured_content_bytes' | 'tool_response_file_bytes'
-> {
-    if (!responseBytes) return {};
-    return {
-        tool_response_content_bytes: responseBytes.contentBytes,
-        tool_response_structured_content_bytes: responseBytes.structuredContentBytes,
-        tool_response_file_bytes: responseBytes.fileBytes,
-    };
+export function getHttpErrorHint(status: number | undefined): string | undefined {
+    if (status === 403) return 'The resource may be private or your token may lack access.';
+    if (status === 401) return 'Authentication failed, check APIFY_TOKEN is set and valid.';
+    return undefined;
 }
 
 /** User-facing error text for tool execution failures with HTTP-aware hints. */
 export function getToolCallErrorUserText(toolName: string, error: unknown): string {
-    const msg = error instanceof Error ? error.message : String(error);
-    const status = getHttpStatusCode(error);
+    let msg = error instanceof Error ? error.message : String(error);
+    // The model only sees the message, so name the API's error type (e.g.
+    // "actor-task-name-not-unique") to let it report the exact failure.
+    const apiErrorType = getApifyErrorType(error);
+    if (apiErrorType) {
+        msg = `${msg} (API error type: ${apiErrorType})`;
+    }
     if (isActorRunLimitError(error)) {
         return `Error calling tool "${toolName}": ${msg}. ${ACTOR_RUN_LIMIT_MESSAGE}`;
     }
-    if (status === 403) {
-        return `Error calling tool "${toolName}": ${msg}. The resource may be private or your token may lack access.`;
+    if (isCannotPublishTaskError(error)) {
+        return (
+            `Error calling tool "${toolName}": ${msg}.\n\n` +
+            'The API validates supplied `publicConfig` fields on create and update, and all publication ' +
+            'requirements on publish. Fix the stated requirement before retrying. If `datasetView` is invalid, ' +
+            'ask the user for its key; no tool can list dataset views.'
+        );
     }
-    if (status === 401) {
-        return `Error calling tool "${toolName}": ${msg}. Authentication failed — check APIFY_TOKEN is set and valid.`;
-    }
-    return `Error calling tool "${toolName}": ${msg}. Verify the tool name and input parameters.`;
+    const hint = getHttpErrorHint(getHttpStatusCode(error)) ?? 'Verify the tool name and input parameters.';
+    return `Error calling tool "${toolName}": ${msg}. ${hint}`;
+}
+
+/** Texts for a confirmed platform input-validation error — same shape wherever start() can throw one. */
+export function buildInvalidInputTexts(actorName: string, errMsg: string, inputSchema?: ToolInputSchema): string[] {
+    return [
+        `Failed to call Actor '${actorName}': ${errMsg}`,
+        `Please ensure the input is correct and matches the Actor's input schema.`,
+        ...(inputSchema ? [`Input schema:\n${wrapJsonText(inputSchema)}`] : []),
+    ];
 }

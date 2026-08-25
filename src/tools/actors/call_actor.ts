@@ -1,5 +1,6 @@
 import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import type { ApifyApiError } from 'apify-client';
+import type { ContentBlock } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import dedent from 'dedent';
 import { z } from 'zod';
 
@@ -12,29 +13,46 @@ import {
     APIFY_ERROR_TYPE_MEMORY_LIMIT_EXCEEDED,
     FAILURE_CATEGORY,
     HELPER_TOOLS,
-    TOOL_STATUS,
 } from '../../const.js';
 import { ACTOR_LOAD_ERROR_KIND, ActorLoadError } from '../../errors.js';
 import { connectMCPClient } from '../../mcp/client.js';
+import { EXTERNAL_TOOL_CALL_TIMEOUT_MSEC } from '../../mcp/const.js';
 import type { PaymentProvider } from '../../payments/types.js';
-import type { ActorInfo, ApifyToken, InternalToolArgs, ToolEntry, ToolInputSchema } from '../../types.js';
-import { TOOL_TYPE } from '../../types.js';
+import type {
+    ActorInfo,
+    ApifyToken,
+    InternalToolArgs,
+    ToolDescriptionContext,
+    ToolEntry,
+    ToolInputSchema,
+} from '../../types.js';
+import { ALL_TOOLS_PRESENT, TOOL_TYPE } from '../../types.js';
 import { getActorDefinitionCached, getActorMcpUrlCached } from '../../utils/actor.js';
 import { compileSchema } from '../../utils/ajv.js';
 import {
     ACTOR_RUN_LIMIT_MESSAGE,
+    isActorInputValidationError,
     isActorRunLimitError,
     isMemoryQuotaError,
     isPermissionApprovalError,
     remoteMcpFailureDetail,
 } from '../../utils/apify_errors.js';
 import { getConsoleLinkContext } from '../../utils/console_link.js';
-import { getHttpStatusCode, logHttpError } from '../../utils/logging.js';
-import { buildMCPResponse } from '../../utils/mcp.js';
-import { classifyFailureCategory, extractAjvErrorDetails, getToolStatusFromError } from '../../utils/tool_status.js';
+import { wrapJsonText } from '../../utils/encode_text.js';
+import { logHttpError } from '../../utils/logging.js';
+import {
+    buildInvalidInputTexts,
+    respondAborted,
+    respondRaw,
+    respondServerError,
+    respondUserError,
+    type ToolResponse,
+} from '../../utils/mcp.js';
+import { buildPermissionApprovalTexts } from '../../utils/payment_errors.js';
+import { classifyFailureCategory, extractAjvErrorDetails } from '../../utils/tool_status.js';
 import { extractActorId } from '../../utils/tools.js';
 import { actorNameToToolName, isActorBlockedUnderPaymentProvider } from '../actor_tool_naming.js';
-import { buildGetActorRunSuccessResponse } from '../runs/get_actor_run.js';
+import { buildGetActorRunResponse } from '../runs/get_actor_run.js';
 import { actorRunOutputSchema } from '../structured_output_schemas.js';
 import {
     abortRunOnSignal,
@@ -53,18 +71,22 @@ const RAG_WEB_BROWSER_TOOL = actorNameToToolName('apify/rag-web-browser');
 export const CALL_ACTOR_MCP_MISSING_TOOL_NAME_MSG = `When calling an MCP server Actor, you must specify the tool name in the actor parameter as "{actorName}:{toolName}" in the "actor" input property.`;
 
 /** Shared MCP server instructions — identical in both modes. */
-export const CALL_ACTOR_MCP_SERVER_SECTION = `For MCP server Actors:
-- Use fetch-actor-details with output={ mcpTools: true } to list available tools
-- Call using format: "actorName:toolName" (e.g., "apify/actors-mcp-server:fetch-apify-docs")`;
+export function buildCallActorMcpServerSection({ hasTool }: ToolDescriptionContext): string {
+    return `For MCP server Actors:
+${hasTool(HELPER_TOOLS.ACTOR_GET_DETAILS) ? `- Use ${HELPER_TOOLS.ACTOR_GET_DETAILS} with output={ mcpTools: true } to list available tools\n` : ''}- Call using format: "actorName:toolName" (e.g., "apify/actors-mcp-server:fetch-apify-docs")`;
+}
 
 /** Shared "two ways to run" + USAGE section — identical in both modes. */
-export const CALL_ACTOR_USAGE_SECTION = `There are two ways to run Actors:
-1. Dedicated Actor tools (e.g., ${RAG_WEB_BROWSER_TOOL}): These are pre-configured tools, offering a simpler and more direct experience.
+function buildCallActorUsageSection({ hasTool }: ToolDescriptionContext): string {
+    const actorToolExample = hasTool(RAG_WEB_BROWSER_TOOL) ? ` (e.g., ${RAG_WEB_BROWSER_TOOL})` : '';
+    return `There are two ways to run Actors:
+1. Dedicated Actor tools${actorToolExample}: These are pre-configured tools, offering a simpler and more direct experience.
 2. Generic call-actor tool (${HELPER_TOOLS.ACTOR_CALL}): Use this when a dedicated tool is not available or when you want to run any Actor dynamically. This tool is especially useful if you do not want to add specific tools or your client does not support dynamic tool registration.
 
 USAGE:
-- Always use dedicated tools when available (e.g., ${RAG_WEB_BROWSER_TOOL})
+- Always use dedicated tools when available${actorToolExample}
 - Use the generic call-actor tool only if a dedicated tool does not exist for your Actor.`;
+}
 
 /** Shared examples section — identical in both modes. */
 export const CALL_ACTOR_EXAMPLES_SECTION = `EXAMPLES:
@@ -75,138 +97,145 @@ type CallActorErrorResponseParams = {
     error: unknown;
     actorId?: string;
     mcpSessionId?: string;
-    actorGetDetailsTool: typeof HELPER_TOOLS.ACTOR_GET_DETAILS;
+    /** Names of all currently loaded tools — gates which recovery tools this error may name. */
+    loadedToolNames: readonly string[];
+    /** Actor's input schema, echoed back only on a confirmed platform input-validation error. */
+    inputSchema?: ToolInputSchema;
 };
 
-const WIDGET_ADDENDUM = dedent`
-    WIDGET ALTERNATIVE (apps mode):
-    - If the user explicitly asks to see live progress, call ${HELPER_TOOLS.ACTOR_CALL_WIDGET} instead — it renders an interactive UI that tracks the run.
-    - For silent name resolution before this call, use ${HELPER_TOOLS.STORE_SEARCH} (not ${HELPER_TOOLS.STORE_SEARCH_WIDGET}, which renders UI).
-`;
+/**
+ * Recovery offers for a failed call, naming only the tools actually loaded in this session —
+ * omits the sentence if none are. Not for the not-found branch of `resolveAndValidateActor`:
+ * there the Actor does not exist, so the detail-lookup offer is a dead end.
+ */
+function buildCallFailureRecoveryHint(loadedToolNames: readonly string[]): string {
+    const hints = [
+        loadedToolNames.includes(HELPER_TOOLS.STORE_SEARCH)
+            ? `search for available Actors using ${HELPER_TOOLS.STORE_SEARCH}`
+            : '',
+        loadedToolNames.includes(HELPER_TOOLS.ACTOR_GET_DETAILS)
+            ? `get Actor details using ${HELPER_TOOLS.ACTOR_GET_DETAILS}`
+            : '',
+    ].filter(Boolean);
+    return hints.length ? `You can ${hints.join(', or ')}.` : '';
+}
 
-function buildCallActorDescriptionSections(includeWidget: boolean): string {
+// call-actor-widget needs no hasTool gate: apps mode appends it whenever call-actor is served.
+function buildWidgetAddendum({ hasTool }: ToolDescriptionContext): string {
+    return dedent`
+        WIDGET ALTERNATIVE (apps mode):
+        - If the user explicitly asks to see live progress, call ${HELPER_TOOLS.ACTOR_CALL_WIDGET} instead — it renders an interactive UI that tracks the run.
+        ${hasTool(HELPER_TOOLS.STORE_SEARCH) ? `- For silent name resolution before this call, use ${HELPER_TOOLS.STORE_SEARCH} (not ${HELPER_TOOLS.STORE_SEARCH_WIDGET}, which renders UI).` : ''}
+    `;
+}
+
+function buildCallActorDescriptionSections(includeWidget: boolean, ctx: ToolDescriptionContext): string {
+    const { hasTool } = ctx;
+    const workflowSection = [
+        'WORKFLOW:',
+        ...(hasTool(HELPER_TOOLS.ACTOR_GET_DETAILS)
+            ? [
+                  `1. Use ${HELPER_TOOLS.ACTOR_GET_DETAILS} to get the Actor's input schema`,
+                  '2. Call this tool with the actor name and proper input based on the schema',
+              ]
+            : ['Call this tool with the actor name and proper input matching the Actor input schema.']),
+        ...(hasTool(HELPER_TOOLS.STORE_SEARCH)
+            ? [
+                  '',
+                  `If the actor name is not in "username/name" format, use ${HELPER_TOOLS.STORE_SEARCH} to resolve the correct Actor first.`,
+              ]
+            : []),
+    ].join('\n');
     const sections: string[] = [
         'Call any Actor from the Apify Store.',
-        dedent`
-            WORKFLOW:
-            1. Use ${HELPER_TOOLS.ACTOR_GET_DETAILS} to get the Actor's input schema
-            2. Call this tool with the actor name and proper input based on the schema
-
-            If the actor name is not in "username/name" format and ${HELPER_TOOLS.STORE_SEARCH} is available in this session, use it to resolve the correct Actor first.
-        `,
-        CALL_ACTOR_MCP_SERVER_SECTION,
+        workflowSection,
+        buildCallActorMcpServerSection(ctx),
         dedent`
             IMPORTANT:
-            - Waits up to waitSecs (default 30s) for completion; returns run status, storage IDs, and field metadata
+            - Waits up to waitSecs (default 30s) for completion; returns run status and storage IDs, and with waitSecs > 0 also reports dataset field metadata
             - Use ${HELPER_TOOLS.DATASET_GET_ITEMS} with the datasetId to fetch results; non-terminal runs include a nextStep with polling instructions
             - Use dedicated Actor tools when available for better experience
         `,
-        CALL_ACTOR_USAGE_SECTION,
+        buildCallActorUsageSection(ctx),
         dedent`
             - Use \`waitSecs\` (0–45) to control how long to wait. Default 30s returns results for fast actors. Use \`waitSecs: 0\` to start and return immediately for long-running actors.
         `,
         CALL_ACTOR_EXAMPLES_SECTION,
     ];
 
-    if (includeWidget) sections.push(WIDGET_ADDENDUM);
+    if (includeWidget) sections.push(buildWidgetAddendum(ctx));
 
     return sections.join('\n\n');
 }
 
-export function buildCallActorDescription(): string {
-    return buildCallActorDescriptionSections(false);
+export function buildCallActorDescription(ctx: ToolDescriptionContext = ALL_TOOLS_PRESENT): string {
+    return buildCallActorDescriptionSections(false, ctx);
 }
 
-export function buildCallActorAppsDescription(): string {
-    return buildCallActorDescriptionSections(true);
+export function buildCallActorAppsDescription(ctx: ToolDescriptionContext = ALL_TOOLS_PRESENT): string {
+    return buildCallActorDescriptionSections(true, ctx);
 }
 
-/** Exported for native actor tool error handling in server.ts — no logging, no telemetry. */
-export function buildPermissionApprovalResponse(error: ApifyApiError): ReturnType<typeof buildMCPResponse> {
-    const approvalUrl = typeof error.data?.approvalUrl === 'string' ? error.data.approvalUrl : undefined;
-    return buildMCPResponse({
-        texts: [error.message, ...(approvalUrl ? [`Approve here: ${approvalUrl}`] : [])],
-        isError: true,
-    });
-}
-
-function buildPermissionApprovalErrorResponse(
-    actorName: string,
-    error: ApifyApiError,
-    actorId: string | undefined,
-    mcpSessionId: string | undefined,
-): ReturnType<typeof buildMCPResponse> {
-    logHttpError(error, 'Failed to call Actor — permission approval required', {
-        actorName,
-        mcpSessionId,
-        failureCategory: FAILURE_CATEGORY.PERMISSION_APPROVAL_REQUIRED,
-    });
-    return {
-        ...buildPermissionApprovalResponse(error),
-        toolTelemetry: {
-            toolStatus: TOOL_STATUS.SOFT_FAIL,
-            failureCategory: FAILURE_CATEGORY.PERMISSION_APPROVAL_REQUIRED,
-            failureHttpStatus: error.statusCode,
-            failureDetail: APIFY_ERROR_TYPE_FULL_PERMISSION_NOT_APPROVED,
-            actorId,
-        },
-    };
-}
-
-export function buildCallActorErrorResponse(params: CallActorErrorResponseParams): ReturnType<typeof buildMCPResponse> {
-    const { actorName, error, actorId, mcpSessionId, actorGetDetailsTool } = params;
+export function buildCallActorErrorResponse(params: CallActorErrorResponseParams): ToolResponse {
+    const { actorName, error, actorId, mcpSessionId, loadedToolNames, inputSchema } = params;
 
     if (isPermissionApprovalError(error)) {
-        return buildPermissionApprovalErrorResponse(actorName, error, actorId, mcpSessionId);
+        logHttpError(error, 'Failed to call Actor — permission approval required', {
+            actorName,
+            mcpSessionId,
+            failureCategory: FAILURE_CATEGORY.PERMISSION_APPROVAL_REQUIRED,
+        });
+        return respondUserError(buildPermissionApprovalTexts(error), {
+            category: FAILURE_CATEGORY.PERMISSION_APPROVAL_REQUIRED,
+            httpStatus: error.statusCode,
+            detail: APIFY_ERROR_TYPE_FULL_PERMISSION_NOT_APPROVED,
+            actorId,
+        });
     }
 
     const errMsg = error instanceof Error ? error.message : String(error);
-    const failureCategory = classifyFailureCategory(error);
     logHttpError(error, 'Failed to call Actor', {
         actorName,
         mcpSessionId,
-        failureCategory,
+        failureCategory: classifyFailureCategory(error),
     });
-
-    const telemetry = {
-        toolStatus: getToolStatusFromError(error, false),
-        failureCategory,
-        failureHttpStatus: getHttpStatusCode(error),
-        failureDetail: errMsg.slice(0, 200),
-        actorId,
-    };
 
     if (isMemoryQuotaError(error)) {
         // Deliberately do NOT mention actor-runs-abort as a recovery path — nudging the LLM
         // toward "free capacity" risks aborting unrelated in-flight runs the user cares about.
-        return buildMCPResponse({
-            texts: [
+        return respondServerError(
+            [
                 `Failed to call Actor '${actorName}': ${errMsg}`,
                 `Account memory quota exceeded for your plan. Retry with a smaller callOptions.memory, or wait for current runs to finish before retrying.`,
             ],
-            isError: true,
-            telemetry: { ...telemetry, failureDetail: APIFY_ERROR_TYPE_MEMORY_LIMIT_EXCEEDED },
-        });
+            { error, detail: APIFY_ERROR_TYPE_MEMORY_LIMIT_EXCEEDED, actorId },
+        );
     }
 
     if (isActorRunLimitError(error)) {
-        return buildMCPResponse({
-            texts: [`Failed to call Actor '${actorName}': ${errMsg}`, ACTOR_RUN_LIMIT_MESSAGE],
-            isError: true,
-            telemetry: { ...telemetry, failureDetail: APIFY_ERROR_TYPE_CANNOT_START_ACTOR_RUNS },
+        return respondServerError([`Failed to call Actor '${actorName}': ${errMsg}`, ACTOR_RUN_LIMIT_MESSAGE], {
+            error,
+            detail: APIFY_ERROR_TYPE_CANNOT_START_ACTOR_RUNS,
+            actorId,
         });
     }
 
-    return buildMCPResponse({
-        texts: [
+    // Checked before the generic fallback below: the Actor was found fine, only its input wasn't.
+    if (isActorInputValidationError(error)) {
+        return respondUserError(buildInvalidInputTexts(actorName, errMsg, inputSchema), {
+            actorId,
+            detail: errMsg.slice(0, 200),
+        });
+    }
+
+    return respondServerError(
+        [
             `Failed to call Actor '${actorName}': ${errMsg}`,
             `Please verify the Actor name, input parameters, and ensure the Actor exists.`,
-            // "if available" — search-actors may not be loaded in apps-mode partial tool selections.
-            `If ${HELPER_TOOLS.STORE_SEARCH} is available in this session, you can use it to search for available Actors, or get Actor details using: ${actorGetDetailsTool}.`,
-        ],
-        isError: true,
-        telemetry,
-    });
+            buildCallFailureRecoveryHint(loadedToolNames),
+        ].filter(Boolean),
+        { error, detail: errMsg.slice(0, 200), actorId },
+    );
 }
 
 export const callOptionsSchema = z.object({
@@ -317,11 +346,7 @@ export async function checkPaymentProviderStandbyConflict(params: {
         failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
     });
 
-    return buildMCPResponse({
-        texts: [ActorLoadError.standbyPaymentNotSupported(normalizedActorName).message],
-        isError: true,
-        telemetry: { toolStatus: TOOL_STATUS.SOFT_FAIL, failureCategory: FAILURE_CATEGORY.INVALID_INPUT },
-    });
+    return respondUserError(ActorLoadError.standbyPaymentNotSupported(normalizedActorName).message);
 }
 
 /**
@@ -354,39 +379,43 @@ export async function handleMcpToolCall(params: {
     mcpServerUrl: string | false;
     apifyToken: string;
     mcpSessionId?: string;
-}): Promise<object | null> {
-    const { baseActorName, mcpToolName, input, isActorMcpServer, mcpServerUrl, apifyToken, mcpSessionId } = params;
+    signal: AbortSignal;
+}): Promise<ToolResponse | null> {
+    const { baseActorName, mcpToolName, input, isActorMcpServer, mcpServerUrl, apifyToken, mcpSessionId, signal } =
+        params;
 
     if (!isActorMcpServer) {
-        return buildMCPResponse({
-            texts: [`Actor '${baseActorName}' is not an MCP server.`],
-            isError: true,
-        });
+        return respondServerError(`Actor '${baseActorName}' is not an MCP server.`);
     }
 
     if (!input) {
-        return buildMCPResponse({
-            texts: [
-                `Input is required for MCP tool '${mcpToolName}'. Please provide the input parameter based on the tool's input schema.`,
-            ],
-            isError: true,
-        });
+        return respondServerError(
+            `Input is required for MCP tool '${mcpToolName}'. Please provide the input parameter based on the tool's input schema.`,
+        );
+    }
+
+    if (signal.aborted) {
+        return respondAborted();
     }
 
     let client: Client | null = null;
     try {
         client = await connectMCPClient(mcpServerUrl as string, apifyToken, mcpSessionId);
         if (!client) {
-            return buildMCPResponse({
-                texts: [`Failed to connect to MCP server ${mcpServerUrl}`],
-                isError: true,
-            });
+            return respondServerError(`Failed to connect to MCP server ${mcpServerUrl}`);
         }
 
-        const result = await client.callTool({
-            name: mcpToolName,
-            arguments: input,
-        });
+        const result = await client.callTool(
+            {
+                name: mcpToolName,
+                arguments: input,
+            },
+            CallToolResultSchema,
+            {
+                timeout: EXTERNAL_TOOL_CALL_TIMEOUT_MSEC,
+                signal,
+            },
+        );
 
         // `call-actor` declares `actorRunOutputSchema`, so MCP SDK ≥ 1.11.4 rejects any response
         // without `structuredContent` (unless `isError: true`) with -32600. The pass-through has no
@@ -394,8 +423,8 @@ export async function handleMcpToolCall(params: {
         // the remote tool's payload still flows through `content`. Also forward `isError` so a
         // failing remote tool surfaces as a failure here.
         const isErrorFromRemote = result.isError === true;
-        return {
-            content: result.content,
+        return respondRaw({
+            content: result.content as ContentBlock[],
             isError: isErrorFromRemote,
             structuredContent: {
                 runId: 'mcp-passthrough',
@@ -406,18 +435,21 @@ export async function handleMcpToolCall(params: {
                 summary: `Called MCP tool '${mcpToolName}' on '${baseActorName}'.`,
                 nextStep: 'Response content carries the remote MCP tool result; no Apify run was started.',
             },
-        };
+        });
     } catch (error) {
+        if (signal.aborted) {
+            // Yield a macrotask first: the SDK sends notifications/cancelled fire-and-forget on the
+            // transport's AbortController, which the finally's close() would abort before it flushes.
+            await new Promise((resolve) => setImmediate(resolve));
+            return respondAborted();
+        }
         logHttpError(error, `Failed to call MCP tool '${mcpToolName}' on Actor '${baseActorName}'`, {
             actorName: baseActorName,
             toolName: mcpToolName,
         });
-        return buildMCPResponse({
-            texts: [
-                `Failed to call MCP tool '${mcpToolName}' on Actor '${baseActorName}': ${remoteMcpFailureDetail(error)}`,
-            ],
-            isError: true,
-        });
+        return respondServerError(
+            `Failed to call MCP tool '${mcpToolName}' on Actor '${baseActorName}': ${remoteMcpFailureDetail(error)}`,
+        );
     } finally {
         if (client) await client.close();
     }
@@ -431,9 +463,9 @@ export async function resolveAndValidateActor(params: {
     actorName: string;
     input: Record<string, unknown>;
     toolArgs: InternalToolArgs;
-}): Promise<{ error: object } | { actor: ToolEntry }> {
+}): Promise<{ error: ToolResponse } | { actor: ToolEntry }> {
     const { actorName, input, toolArgs } = params;
-    const { apifyClient } = toolArgs;
+    const { apifyClient, loadedToolNames } = toolArgs;
 
     const { tools, errors } = await getActorsAsTools([actorName], apifyClient, {
         mcpSessionId: toolArgs.mcpSessionId,
@@ -449,23 +481,20 @@ export async function resolveAndValidateActor(params: {
     const actor = tools[0];
 
     if (!actor) {
+        // See apify/apify-mcp-server#1296.
+        // Only search-actors: the Actor does not exist, so buildCallFailureRecoveryHint's second
+        // offer (get Actor details) would send the model to a lookup that fails the same way.
+        const recovery = loadedToolNames.includes(HELPER_TOOLS.STORE_SEARCH)
+            ? `\nYou can search for available Actors using the tool: ${HELPER_TOOLS.STORE_SEARCH}.`
+            : '';
         return {
-            error: buildMCPResponse({
-                texts: [
-                    dedent`
+            error: respondUserError(
+                dedent`
                     Actor '${actorName}' was not found.
                     Please verify Actor ID or name format (e.g., "username/name" like "apify/rag-web-browser") and ensure that the Actor exists.
-                    You can search for available Actors using the tool: ${HELPER_TOOLS.STORE_SEARCH}.
-                `,
-                ],
-                isError: true,
-                telemetry: {
-                    toolStatus: TOOL_STATUS.SOFT_FAIL,
-                    failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
-                    failureHttpStatus: 404,
-                    failureDetail: `Actor '${actorName}' was not found`,
-                },
-            }),
+                ` + recovery,
+                { httpStatus: 404, detail: `Actor '${actorName}' was not found` },
+            ),
         };
     }
 
@@ -478,20 +507,14 @@ export async function resolveAndValidateActor(params: {
             failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
         });
         return {
-            error: buildMCPResponse({
-                texts: [
+            error: respondUserError(
+                [
                     `Input is required for Actor '${actorName}'. Please provide the input parameter based on the Actor's input schema.`,
                     `The input schema for this Actor was retrieved and is shown below:`,
-                    `\`\`\`json\n${JSON.stringify(actor.inputSchema)}\n\`\`\``,
+                    wrapJsonText(actor.inputSchema),
                 ],
-                isError: true,
-                telemetry: {
-                    toolStatus: TOOL_STATUS.SOFT_FAIL,
-                    failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
-                    actorId,
-                    failureDetail: 'input is required',
-                },
-            }),
+                { actorId, detail: 'input is required' },
+            ),
         };
     }
 
@@ -511,22 +534,16 @@ export async function resolveAndValidateActor(params: {
 
         const content = [
             `Input validation failed for Actor '${actorName}'. Please ensure your input matches the Actor's input schema.`,
-            `Input schema:\n\`\`\`json\n${JSON.stringify(actor.inputSchema)}\n\`\`\``,
+            `Input schema:\n${wrapJsonText(actor.inputSchema)}`,
         ];
         if (validationSummary) {
             content.push(`Validation errors: ${validationSummary}`);
         }
         return {
-            error: buildMCPResponse({
-                texts: content,
-                isError: true,
-                telemetry: {
-                    toolStatus: TOOL_STATUS.SOFT_FAIL,
-                    failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
-                    actorId,
-                    failureDetail: validationSummary.slice(0, 200) || 'input validation failed',
-                    ajvErrorDetails: ajvDetails,
-                },
+            error: respondUserError(content, {
+                actorId,
+                detail: validationSummary.slice(0, 200) || 'input validation failed',
+                ajvErrorDetails: ajvDetails,
             }),
         };
     }
@@ -551,7 +568,7 @@ export async function callActorPreExecute(
     toolArgs: InternalToolArgs,
     options: { route: string },
 ): Promise<
-    | { earlyResponse: object }
+    | { earlyResponse: ToolResponse }
     | {
           parsed: CallActorParsedArgs;
           baseActorName: string;
@@ -577,10 +594,7 @@ export async function callActorPreExecute(
     const isMcpToolNameInvalid = mcpToolName === undefined || mcpToolName.trim().length === 0;
     if (isActorMcpServer && isMcpToolNameInvalid) {
         return {
-            earlyResponse: buildMCPResponse({
-                texts: [CALL_ACTOR_MCP_MISSING_TOOL_NAME_MSG],
-                isError: true,
-            }),
+            earlyResponse: respondServerError(CALL_ACTOR_MCP_MISSING_TOOL_NAME_MSG),
         };
     }
 
@@ -594,6 +608,7 @@ export async function callActorPreExecute(
             mcpServerUrl: mcpServerUrlOrFalse,
             apifyToken,
             mcpSessionId,
+            signal: toolArgs.signal,
         });
         if (mcpResult) {
             return { earlyResponse: mcpResult };
@@ -607,7 +622,7 @@ export async function callActorPreExecute(
  * Shared start-then-wait flow for call-actor variants (default + apps).
  * `taskMode` is honored — when true, `waitSecs` is ignored and the SDK waits until terminal.
  */
-export async function executeCallActor(toolArgs: InternalToolArgs): Promise<object> {
+export async function executeCallActor(toolArgs: InternalToolArgs): Promise<ToolResponse> {
     const preResult = await callActorPreExecute(toolArgs, { route: HELPER_TOOLS.ACTOR_CALL });
     if ('earlyResponse' in preResult) {
         return preResult.earlyResponse;
@@ -620,6 +635,7 @@ export async function executeCallActor(toolArgs: InternalToolArgs): Promise<obje
     const waitSecs = toolArgs.taskMode ? undefined : parsed.waitSecs;
 
     let resolvedActorId: string | undefined;
+    let resolvedInputSchema: ToolInputSchema | undefined;
     try {
         const resolution = await resolveAndValidateActor({
             actorName: baseActorName,
@@ -631,10 +647,11 @@ export async function executeCallActor(toolArgs: InternalToolArgs): Promise<obje
         }
 
         resolvedActorId = extractActorId(resolution.actor);
+        resolvedInputSchema = resolution.actor.inputSchema;
         const { apifyClient } = toolArgs;
-        const abortSignal = toolArgs.extra.signal;
+        const abortSignal = toolArgs.signal;
 
-        if (abortSignal?.aborted) return {};
+        if (abortSignal?.aborted) return respondAborted();
 
         const actorRun = await apifyClient.actor(baseActorName).start(input, callOptions);
         log.debug('Started Actor run', {
@@ -647,7 +664,7 @@ export async function executeCallActor(toolArgs: InternalToolArgs): Promise<obje
         // Abort can arrive while start() was in flight — abort the newly created run.
         if (abortSignal?.aborted) {
             await abortRunOnSignal(actorRun.id, apifyClient);
-            return {};
+            return respondAborted();
         }
 
         const linkContext = await getConsoleLinkContext(toolArgs.apifyToken, apifyClient);
@@ -669,11 +686,11 @@ export async function executeCallActor(toolArgs: InternalToolArgs): Promise<obje
             onAbort: abortRunOnSignal,
         });
 
-        if ('aborted' in fetchResult) return {};
+        if ('aborted' in fetchResult) return respondAborted();
         if ('error' in fetchResult) return fetchResult.error;
 
         return {
-            ...buildGetActorRunSuccessResponse({ ...fetchResult.result, widget: false, linkContext }),
+            ...buildGetActorRunResponse({ ...fetchResult.result, linkContext }),
             toolTelemetry: { actorId: resolvedActorId },
         };
     } catch (error) {
@@ -682,7 +699,8 @@ export async function executeCallActor(toolArgs: InternalToolArgs): Promise<obje
             error,
             actorId: resolvedActorId,
             mcpSessionId: toolArgs.mcpSessionId,
-            actorGetDetailsTool: HELPER_TOOLS.ACTOR_GET_DETAILS,
+            loadedToolNames: toolArgs.loadedToolNames,
+            inputSchema: resolvedInputSchema,
         });
     }
 }
@@ -691,12 +709,13 @@ export async function executeCallActor(toolArgs: InternalToolArgs): Promise<obje
  * Single call-actor definition shared by both modes — only the description differs
  * (apps mode appends a widget addendum).
  */
-function createCallActorTool(description: string): ToolEntry {
+function createCallActorTool(buildDescription: (ctx: ToolDescriptionContext) => string): ToolEntry {
     return Object.freeze({
         type: TOOL_TYPE.INTERNAL,
         name: HELPER_TOOLS.ACTOR_CALL,
         title: 'Call Actor',
-        description,
+        description: buildDescription(ALL_TOOLS_PRESENT),
+        buildDescription,
         inputSchema: callActorInputSchema,
         outputSchema: actorRunOutputSchema,
         ajvValidate: callActorAjvValidate,
@@ -709,7 +728,6 @@ function createCallActorTool(description: string): ToolEntry {
             openWorldHint: true,
         },
         execution: {
-            // Support long-running tasks
             taskSupport: 'optional',
         },
         call: async (toolArgs: InternalToolArgs) => executeCallActor(toolArgs),
@@ -717,10 +735,10 @@ function createCallActorTool(description: string): ToolEntry {
 }
 
 /** Default mode call-actor tool. */
-export const callActorDefault: ToolEntry = createCallActorTool(buildCallActorDescription());
+export const callActorDefault: ToolEntry = createCallActorTool(buildCallActorDescription);
 
 /**
  * Apps mode call-actor tool.
  * Renders no widget; for a live progress UI, use the call-actor-widget sibling.
  */
-export const callActorApps: ToolEntry = createCallActorTool(buildCallActorAppsDescription());
+export const callActorApps: ToolEntry = createCallActorTool(buildCallActorAppsDescription);

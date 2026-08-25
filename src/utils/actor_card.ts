@@ -1,4 +1,4 @@
-import { APIFY_STORE_URL, MAX_INPUT_FIELDS_IN_ACTOR_CARD } from '../const.js';
+import { APIFY_STORE_URL, MAX_INPUT_FIELDS_IN_ACTOR_CARD, OFFICIAL_APIFY_USERNAMES } from '../const.js';
 import type { Actor, ActorCardOptions, ActorStoreInputSchema, ActorStoreList, StructuredActorCard } from '../types.js';
 import { buildConsoleActorUrl } from './console_link.js';
 import {
@@ -49,7 +49,6 @@ function inputFieldsToString(inputSchema: ActorStoreInputSchema): string | null 
     return `- **Input fields:** ${fields}${suffix}`;
 }
 
-// Helper function to format categories from uppercase with underscores to a proper case
 function formatCategories(categories?: string[]): string[] {
     if (!categories) return [];
 
@@ -98,7 +97,6 @@ type ExtractedActorData = {
     stats?: {
         totalUsers: number;
         monthlyUsers: number;
-        successRate?: number;
         bookmarks?: number;
     };
     rating?: {
@@ -146,17 +144,6 @@ function extractActorData(actor: Actor | ActorStoreList, options: ActorCardOptio
             };
         }
 
-        if ('publicActorRunStats30Days' in stats && stats.publicActorRunStats30Days) {
-            const runStats = stats.publicActorRunStats30Days as {
-                SUCCEEDED: number;
-                TOTAL: number;
-            };
-            if (runStats.TOTAL > 0) {
-                data.stats ??= { totalUsers: 0, monthlyUsers: 0 };
-                data.stats.successRate = Number(((runStats.SUCCEEDED / runStats.TOTAL) * 100).toFixed(1));
-            }
-        }
-
         const bookmarkCount =
             ('bookmarkCount' in actor && actor.bookmarkCount) || ('bookmarkCount' in stats && stats.bookmarkCount);
         if (bookmarkCount) {
@@ -185,7 +172,7 @@ function extractActorData(actor: Actor | ActorStoreList, options: ActorCardOptio
     if (options.includeMetadata) {
         data.developer = {
             username: actor.username,
-            isOfficialApify: actor.username === 'apify',
+            isOfficialApify: OFFICIAL_APIFY_USERNAMES.has(actor.username),
             url: `${APIFY_STORE_URL}/${actor.username}`,
         };
         data.categories = formatCategories('categories' in actor ? actor.categories : undefined);
@@ -231,9 +218,6 @@ export function formatActorToActorCard(
         const statsParts = [
             `${data.stats.totalUsers.toLocaleString()} total users, ${data.stats.monthlyUsers.toLocaleString()} monthly users`,
         ];
-        if (data.stats.successRate !== undefined) {
-            statsParts.push(`Runs succeeded: ${data.stats.successRate}%`);
-        }
         if (data.stats.bookmarks) {
             statsParts.push(`${data.stats.bookmarks} bookmarks`);
         }

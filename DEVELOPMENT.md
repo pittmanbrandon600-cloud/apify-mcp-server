@@ -27,8 +27,9 @@ tests/
 
 Key entry points:
 
-- `src/index.ts` - Main library export (`ActorsMcpServer` class)
-- `src/index_internals.ts` - Internal exports for testing / advanced usage
+- `src/index.ts` - Main library export (`ActorsMcpServer` class, plus `createStatelessServer` — the per-request registration for 2026-07-28 traffic)
+- `src/index_internals.ts` - Internal exports for testing / advanced usage (`./internals`, consumed by apify-mcp-server-internal)
+- `src/index_internals_test_kit.ts` - Internal exports for this package's own `tests/test_kit/**` only (`./internals/test-kit`)
 - `src/stdio.ts` - Standard input/output (CLI) entry point
 - `src/dev_server.ts` - Express HTTP server for local development (`pnpm start`)
 - `src/input.ts` - Input processing and validation
@@ -46,7 +47,16 @@ This split matters for `serverMode: 'auto'`.
 - Before `initialize`, the server does not yet know whether the client supports MCP Apps.
 - Public preload helpers such as `ActorsMcpServer.loadToolsByName()` and `loadToolsFromUrl()` therefore queue mode-agnostic sources first.
 - Actor tools may still be loaded immediately because they are mode-agnostic.
-- During `initialize`, once client capabilities are known, the server resolves the queued sources into the final mode-dependent tool set.
+- During `initialize`, once client capabilities are known, the server resolves the queued sources into the stateful connection's mode-dependent tool set.
+
+### Two places sources get resolved
+
+Fetched sources are **retained, not drained**, because there are two consumers:
+
+- The stateful (2025-era) path resolves them once at `initialize`, as above, into the shared `ActorsMcpServer.tools` map that lives for the connection.
+- The stateless (2026-07-28) path has no `initialize`. `ActorsMcpServer.createRequestSnapshot()` re-composes **all** retained sources per request, against that request's own resolved mode and declared client identity, into a snapshot the shared map never sees.
+
+Consequence for both: a tool only reaches the stateless path if it arrives through a load path. `upsertTools()` writes the shared map directly and is not reflected back into the sources, so it changes the stateful tool list only (it documents this). `close()` is the opposite — the release point for everything the facade retains, sources included, so nothing composes after it.
 
 Rule of thumb:
 
@@ -138,7 +148,8 @@ Restart Claude Code for the change to take effect. This token is picked up by bo
 | Layer | Command | What it covers |
 |---|---|---|
 | **Unit tests** | `pnpm run test:unit` | Individual modules in isolation — no credentials needed |
-| **Integration tests** | `pnpm run test:integration` | Full server over all transports against real Apify API (requires `APIFY_TOKEN` + `pnpm run build`) |
+| **Integration tests** | `pnpm run test:integration` | Full server over stdio, streamable HTTP and the `2026-07-28` stateless HTTP dimension against real Apify API (requires `APIFY_TOKEN` + `pnpm run build`) |
+| **Conformance tests** | `pnpm run test:conformance` | Official MCP conformance runner (`--suite all`) against a compiled dev server, run once per protocol era — spec versions `2026-07-28` and `2025-11-25`, in that order. The command builds first, runs both eras, and exits with the first non-zero code. `_conformance_tests.yaml`, called by `_integration_tests.yaml`, runs the same coverage in CI. Excluded scenarios and their reasons live in `scripts/conformance_expected_failures_2026_07_28.yaml` and `scripts/conformance_expected_failures_2025_11_25.yaml` (requires `APIFY_TOKEN`; set `PORT` to override port 3001) |
 | **mcpc probing** | `mcpc @stdio tools-call ...` | Interactive end-to-end verification during development |
 | **LLM evals** | CI only — apply `validated` label | Runs `evals/run_evaluation.ts` against multiple models via OpenRouter; requires `PHOENIX_*` and `OPENROUTER_*` secrets |
 
@@ -148,7 +159,7 @@ It also runs automatically on every merge to the `master` branch.
 
 ### Test Actors
 
-Integration tests run against two purpose-built Actors defined in [apify/mcp-server-test-actor](https://github.com/apify/mcp-server-test-actor) and referenced from [`tests/const.ts`](./tests/const.ts):
+Integration tests run against two purpose-built Actors defined in [apify/mcp-server-test-actor](https://github.com/apify/mcp-server-test-actor) and referenced from [`tests/test_kit/helpers.ts`](./tests/test_kit/helpers.ts):
 
 | Actor | Constant | Purpose |
 |---|---|---|
@@ -159,16 +170,31 @@ Integration tests run against two purpose-built Actors defined in [apify/mcp-ser
 
 - `tests/unit/` — unit tests for individual modules
 - `tests/integration/` — integration tests for MCP server functionality
-  - `tests/integration/suite.ts` — **main integration test suite** where all test cases should be added
-  - Other files in this directory set up different transport modes (stdio, streamable-http) that all use `suite.ts`
+  - `tests/integration/suite.ts` — wires the transport dimensions into one shared suite; add new cases to the matching group in `tests/test_kit/cases/*.cases.ts`, not here
+  - Other files in this directory set up different transport dimensions (`stdio`, `2025-11-25` streamable HTTP, and `2026-07-28` stateless HTTP driven by the v2 SDK client) that all use `suite.ts`
 - `tests/helpers.ts` — shared test utilities
-- `tests/const.ts` — test constants
+- `tests/test_kit/helpers.ts` — shared test constants and assertion helpers, published behind `./test-kit`
 
 ### Test organization across repos
 
-This package is also used by the hosted server in `apify-mcp-server-internal`. To avoid copying test bodies across the boundary, each repo owns its own tests.
+**Why `CaseCtx` couples the two repos.** MCP contract tests (protocol, tools, prompts,
+resources) have one correct behavior regardless of who's hosting the server, so they
+live here once and internal imports them — no second copy to keep in sync. Internal
+keeps only what's genuinely deployment-specific: databases, rate limiting, auth,
+multi-node coordination. `CaseCtx` is the seam that makes sharing possible without
+merging the two codebases — it's a non-standard cross-repo dependency injection
+(each side supplies its own client/environment for the same case logic), accepted
+deliberately for this trade-off.
 
-**Tests in this repo** cover the package's MCP and library surface. They live in `tests/integration/suite.ts` and `tests/unit/`:
+This package is also used by the hosted server in `apify-mcp-server-internal`. Every integration case is a `Case` object (`{ name, isDeploymentTest, run, ... }`) defined in `tests/test_kit/cases/*.cases.ts` — published behind the package's `./test-kit` export (`vitest` optional peerDependency). This repo's own `suite.ts` runs every case via `registerCases(name, allGroupCases, ctx)`; internal imports the same case arrays via `@apify/actors-mcp-server/test-kit` and calls `registerCases(name, allCases, { ...ctx, isDeploymentTestOnly: true })` against its own live staging/prod deploy — cases with `isDeploymentTest: false` register as `it.skip` there, so nothing needs re-registering by hand.
+
+Cases that share expensive setup (one seeded Actor run, say) do it via `ctx.getFixture(fixture)` (`Fixture<T> = { key, setup(ctx) }`) instead of a vitest `beforeAll` — `setup` runs at most once per `registerCases` call (once per transport dimension), memoized by `fixture.key`, no matter how many or few of the cases sharing it actually run (e.g. under `isDeploymentTestOnly`). This is what lets `storage.cases.ts`'s 13 cases built on one seeded run stay ordinary, individually eligible-for-`isDeploymentTest` `Case` objects instead of a separate non-flattenable group. See `tests/test_kit/register.ts` and `storage.cases.ts`'s `normalModeRunFixture`.
+
+Marking a case `isDeploymentTest: true` is a one-line edit on its existing definition — there is no second array or file to keep in sync, and internal picks up every current and future deployment-test case automatically on its next dependency bump. Flipping a case to `isDeploymentTest: true` is a per-PR judgment call, not automatic — most cases stay `isDeploymentTest: false` (this-repo-only in practice, since internal only registers the `isDeploymentTest` subset).
+
+This is a real execution decision, not a visibility flag: internal's `isDeploymentTestOnly` `registerCases` call runs as part of its release pipeline — against **staging** when a release PR opens, against **production** when it merges to `master` (real API calls, real Actor runs, billed and user-visible). Mark a case `isDeploymentTest: true` only if it earns that.
+
+**Tests in this repo** cover the package's MCP and library surface. They live in `tests/test_kit/cases/*.cases.ts` (registered through `tests/integration/suite.ts`) and `tests/unit/`:
 
 - MCP protocol — `initialize` handshake, request/response shapes for `tools/*`, `prompts/*`, `resources/*`, `tasks/*`, notification delivery, JSON-RPC error codes.
 - Package logic — tool loader and selectors, widget metadata shape, structured output schemas, prompt registry, built-in tools, `call-actor` `RunResponse` shape, `SkyfirePaymentProvider`, client-name capability detection, `?ui=` server-mode parsing.
@@ -195,9 +221,9 @@ The flow is one way. We're the source; internal smokes guard the package's outpu
 #### Setup
 
 ```bash
-pnpm add -g @apify/mcpc
+brew install apify/tap/mcpc   # or: pnpm add -g @apify/mcpc
 pnpm run build
-mcpc --config .mcp.json stdio connect @stdio
+mcpc connect .mcp.json:stdio @stdio
 mcpc @stdio tools-list   # verify
 ```
 

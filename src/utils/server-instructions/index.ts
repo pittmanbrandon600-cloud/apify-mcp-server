@@ -7,17 +7,24 @@
  * avoiding hallucinated calls to tools absent from `tools/list`.
  */
 
-import { HELPER_TOOLS, RAG_WEB_BROWSER } from '../../const.js';
+import { getApifyAPIBaseUrl } from '../../apify_client.js';
+import { HELPER_TOOLS, RAG_WEB_BROWSER, WEB_FETCH } from '../../const.js';
 import { SERVER_MODE } from '../../types.js';
 
 /**
  * Build server instructions for the given mode.
  *
  * Apps-only sections are omitted in default mode to prevent models from
- * attempting to call widget tools that are not registered.
+ * attempting to call widget tools that are not registered. The report-problem line is
+ * emitted only when `reportProblemAvailable` is true — i.e. `report-problem` is actually
+ * served — so clients that never receive the tool (Anthropic surfaces, telemetry off, or a
+ * `tools=` selection that omits report-problem) are not told to call it.
  */
-export function getServerInstructions(mode: SERVER_MODE = SERVER_MODE.DEFAULT): string {
+export function getServerInstructions(mode: SERVER_MODE = SERVER_MODE.DEFAULT, reportProblemAvailable = false): string {
     const isApps = mode === SERVER_MODE.APPS;
+    // Derive the API base from config so examples match the gate/templates under an
+    // APIFY_API_BASE_URL / staging override, instead of a hardcoded api.apify.com.
+    const apiBaseUrl = getApifyAPIBaseUrl();
 
     return `
 Apify is the world's largest marketplace of tools for web scraping, data extraction, and web automation.
@@ -41,9 +48,22 @@ These tools are called **Actors**. They enable you to extract structured data fr
 - Actor execution may take time, and outputs can be large.
 - Large datasets can be paginated to retrieve results efficiently.
 
+## Actor tasks
+- An Actor task is a saved, reusable configuration of an Actor. It stores the Actor input and run options such as the build, memory, and timeout.
+- Tasks are useful for repeated or scheduled jobs, because the user does not have to configure the Actor again for every run.
+- Creating or updating a task does not make it public.
+- Publishing a task creates a public landing page for one specific use case. The page shows what the task does, the selected input values, and the expected output. Published tasks appear in the Actor's Examples tab, where users, search engines, and AI agents can discover them, which can help people understand the Actor and increase its runs.
+- Publish only tasks that represent a useful, reliable, and specific use case. Not every saved task needs to be public.
+
 ## Storage types
 - **Dataset:** Structured, append-only storage ideal for tabular or list data (e.g., scraped items).
 - **Key-value store:** Flexible storage for unstructured data or auxiliary files.
+
+## Apify API resources
+- Any Apify API GET endpoint can be read as an MCP resource. Pass the full \`${apiBaseUrl}/v2/...\` URL to \`resources/read\`; the server injects the session's Apify token and returns the response body. Reads require an Apify token — a session without one (e.g. payment-only x402/Skyfire) fails with a JSON-RPC error.
+- Actor and tool results return storage IDs, not resource URLs — build the URL from the ID (e.g. a \`datasetId\` becomes \`${apiBaseUrl}/v2/datasets/{datasetId}/items\`) and read it via \`resources/read\`.
+- Reads inline up to ~256 KB; a larger response is not downloaded — it returns a short notice with a download URL instead of the body, so page large datasets/lists with \`limit\` and \`offset\` to stay under the cap.
+- Examples: \`${apiBaseUrl}/v2/datasets/{datasetId}/items?clean=true&format=json&limit=100\`, \`${apiBaseUrl}/v2/key-value-stores/{storeId}/records/{recordKey}\`. \`resources/templates/list\` enumerates the common shapes with their paging parameters.
 ${
     isApps
         ? `
@@ -64,7 +84,7 @@ Some clients render widget-backed Actor tools: the response includes a live UI t
   - For MCP server Actors, use format "actorName:toolName" to call specific tools.
   - Supports a \`waitSecs\` parameter (default 30, max 45):
     - \`waitSecs: 0\`: fire-and-forget — starts the run and returns immediately with a runId.
-    - \`waitSecs > 0\`: waits up to that many seconds for the run to complete, then returns the result.
+    - \`waitSecs > 0\`: waits up to that many seconds for the run to complete, then returns its current status and storage IDs (never the output rows — fetch those with \`${HELPER_TOOLS.DATASET_GET_ITEMS}\`).
 
 ### Tool disambiguation
 - **\`${HELPER_TOOLS.STORE_SEARCH}\` vs \`${HELPER_TOOLS.ACTOR_GET_DETAILS}\`:**
@@ -74,14 +94,22 @@ ${
         ? `- **Data vs widget Actor tools (when the client supports widgets):**
   - \`${HELPER_TOOLS.STORE_SEARCH}\` is a silent data lookup (Actor list for name resolution) with no UI; \`${HELPER_TOOLS.STORE_SEARCH_WIDGET}\` renders an interactive UI element (widget) with Actor search results for the user to browse — use it only when the user explicitly asks to search or discover Actors.
   - \`${HELPER_TOOLS.ACTOR_GET_DETAILS}\` is a silent data lookup (input schema, README, metadata) with no UI; \`${HELPER_TOOLS.ACTOR_GET_DETAILS_WIDGET}\` renders an interactive UI element (widget) with Actor details — use it only when the user explicitly asks to see or browse the Actor.
-  - \`${HELPER_TOOLS.ACTOR_CALL}\` runs the Actor and returns its result (no UI); \`${HELPER_TOOLS.ACTOR_CALL_WIDGET}\` renders an interactive UI element (widget) that tracks live Actor run progress — use it only when the user explicitly asks to see progress.
+  - \`${HELPER_TOOLS.ACTOR_CALL}\` runs the Actor and returns its run status and storage IDs (no UI); \`${HELPER_TOOLS.ACTOR_CALL_WIDGET}\` renders an interactive UI element (widget) that tracks live Actor run progress — use it only when the user explicitly asks to see progress.
   - \`${HELPER_TOOLS.ACTOR_RUNS_GET}\` is a silent data lookup (run status, dataset IDs, stats) with no UI; \`${HELPER_TOOLS.ACTOR_RUNS_GET_WIDGET}\` renders an interactive UI element (widget) showing live run progress for the user — use it only when the user explicitly asks to see run progress.
   - When the next step is running an Actor, prefer silent lookups (\`${HELPER_TOOLS.STORE_SEARCH}\`, \`${HELPER_TOOLS.ACTOR_GET_DETAILS}\`) over widget-backed variants.
 `
         : ''
 }- **\`${HELPER_TOOLS.STORE_SEARCH}\` vs ${RAG_WEB_BROWSER}:**
   \`${HELPER_TOOLS.STORE_SEARCH}\` finds robust and reliable Actors for specific websites; ${RAG_WEB_BROWSER} is a general and versatile web scraping tool.
+- **${WEB_FETCH} vs ${RAG_WEB_BROWSER}:**
+  ${WEB_FETCH} fetches one specific URL and returns its full content verbatim; ${RAG_WEB_BROWSER} searches the web by query and returns content from the top results.
 - **Dedicated Actor tools (e.g. ${RAG_WEB_BROWSER}) vs \`${HELPER_TOOLS.ACTOR_CALL}\`:**
   Prefer dedicated tools when available; use \`${HELPER_TOOLS.ACTOR_CALL}\` only when no specialized tool exists in the Apify store.
-`;
+${
+    reportProblemAvailable
+        ? `
+If a tool or Actor fails and you cannot resolve it, you can report it with \`${HELPER_TOOLS.PROBLEM_REPORT}\`.
+`
+        : ''
+}`;
 }

@@ -4,14 +4,20 @@ import { HELPER_TOOLS } from '../../const.js';
 import type { InternalToolArgs, ToolEntry, ToolInputSchema } from '../../types.js';
 import { TOOL_TYPE } from '../../types.js';
 import { compileSchema } from '../../utils/ajv.js';
+import { respondOk, respondUserError } from '../../utils/mcp.js';
+import { getActorRunLogToolOutputSchema } from '../structured_output_schemas.js';
 
 const GetRunLogArgs = z.object({
     runId: z.string().describe('The ID of the Actor run.'),
-    lines: z.number().max(50).describe('Output the last NUM lines, instead of the last 10').default(10),
+    lines: z
+        .number()
+        .max(50)
+        .describe('Output the last NUM lines, instead of the last 10. Pass 0 to return the entire log.')
+        .default(10),
 });
 
 /**
- * https://docs.apify.com/api/v2/actor-run-get
+ * https://docs.apify.com/api/v2/actor-run-log-get
  *  /v2/actor-runs/{runId}/log{?token}
  */
 export const getActorRunLog: ToolEntry = Object.freeze({
@@ -28,7 +34,7 @@ USAGE EXAMPLES:
 - user_input: Show last 20 lines of logs for run y2h7sK3Wc
 - user_input: Get logs for run y2h7sK3Wc`,
     inputSchema: z.toJSONSchema(GetRunLogArgs) as ToolInputSchema,
-    // It does not make sense to add structured output here since the log API just returns plain text
+    outputSchema: getActorRunLogToolOutputSchema,
     ajvValidate: compileSchema(z.toJSONSchema(GetRunLogArgs)),
     paymentRequired: true,
     annotations: {
@@ -41,9 +47,16 @@ USAGE EXAMPLES:
     call: async (toolArgs: InternalToolArgs) => {
         const { args, apifyClient: client } = toolArgs;
         const parsed = GetRunLogArgs.parse(args);
-        const v = (await client.run(parsed.runId).log().get()) ?? '';
-        const lines = v.split('\n');
-        const text = lines.slice(lines.length - parsed.lines - 1, lines.length).join('\n');
-        return { content: [{ type: 'text', text }] };
+        const v = await client.run(parsed.runId).log().get();
+        // The log endpoint 404s only when the run itself is missing; an existing run with no
+        // output yet returns an empty string. So `undefined` here means "run not found" — do not
+        // coalesce it back to '' (#1193).
+        if (v === undefined) {
+            return respondUserError(`Run with ID '${parsed.runId}' not found.`);
+        }
+        // Logs from the API end with a newline; drop it so the tail slice counts only content lines.
+        const lines = v.replace(/\n$/, '').split('\n');
+        const text = lines.slice(-parsed.lines).join('\n');
+        return respondOk(text, { structuredContent: { log: text } });
     },
 } as const);

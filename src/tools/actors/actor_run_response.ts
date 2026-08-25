@@ -3,14 +3,8 @@ import type { ActorRun, Dataset, KeyValueClientListKeysResult } from 'apify-clie
 import log from '@apify/log';
 
 import type { ApifyClient } from '../../apify_client.js';
-import {
-    DATASET_SIZE_HINT_BYTES,
-    FAILURE_CATEGORY,
-    HELPER_TOOLS,
-    NARROW_OUTPUT_HINT,
-    TOOL_STATUS,
-} from '../../const.js';
-import { getWidgetConfig, WIDGET_URIS } from '../../resources/widgets.js';
+import { DATASET_SIZE_HINT_BYTES, HELPER_TOOLS, NARROW_OUTPUT_HINT } from '../../const.js';
+import { buildActorRunWidgetMeta } from '../../resources/widgets.js';
 import type { ConsoleLinkContext } from '../../types.js';
 import {
     buildConsoleDatasetUrl,
@@ -19,7 +13,7 @@ import {
     VERBATIM_LINKS_NUDGE,
 } from '../../utils/console_link.js';
 import { logHttpError } from '../../utils/logging.js';
-import { buildMCPResponse } from '../../utils/mcp.js';
+import { respondOk, respondUserError, type ToolResponse } from '../../utils/mcp.js';
 import { formatRunStatusMessage, type ProgressTracker, TERMINAL_RUN_STATUSES } from '../../utils/progress.js';
 import { cleanEmptyProperties } from '../../utils/schema_generation.js';
 import { DEFAULT_DATASET_ITEMS_LIMIT } from '../storage/get_dataset_items.js';
@@ -445,17 +439,24 @@ type KvSummary =
 /**
  * `buildRunKeyValueStore` omits `keyCount` on truncation; surface that as "at least N keys"
  * instead of silently substituting `keys.length`.
+ *
+ * The INPUT record (every run's own input echoed back by the platform) never counts: it is
+ * not run output, and advertising it steers agents into get-key-value-store-record detours
+ * when the real output sits in the dataset. `structuredContent.keys` still carries it.
  */
 function summarizeKv(keyValueStore?: RunKeyValueStore): KvSummary {
     const kvId = keyValueStore?.id;
     const keys = keyValueStore?.keys ?? [];
-    if (!kvId || keys.length === 0) {
+    const outputKeys = keys.filter((key) => key !== 'INPUT');
+    if (!kvId || outputKeys.length === 0) {
         return { hasKv: false, summarySuffix: '' };
     }
-    const reportedKeyCount = keyValueStore.keyCount;
-    const kvTruncated = reportedKeyCount === undefined && keys.length === KV_KEYS_LIMIT;
-    const n = reportedKeyCount ?? keys.length;
-    const keyCountLabel = kvTruncated ? `at least ${KV_KEYS_LIMIT} keys` : `${n} ${n === 1 ? 'key' : 'keys'}`;
+    const kvTruncated = keyValueStore.keyCount === undefined && keys.length === KV_KEYS_LIMIT;
+    const n = outputKeys.length;
+    // On truncation the fetched window itself may still hold INPUT; the output-key floor is
+    // one lower than KV_KEYS_LIMIT whenever it does, or the label overstates by one.
+    const truncatedFloor = KV_KEYS_LIMIT - (keys.length - outputKeys.length);
+    const keyCountLabel = kvTruncated ? `at least ${truncatedFloor} keys` : `${n} ${n === 1 ? 'key' : 'keys'}`;
     return { hasKv: true, kvId, keys, keyCountLabel, summarySuffix: ` Key-value store has ${keyCountLabel}.` };
 }
 
@@ -481,6 +482,7 @@ function buildSucceededSummaryNextStep(
     statusMessage: string | null | undefined,
     dataset?: RunDataset,
     keyValueStore?: RunKeyValueStore,
+    datasetMetadataFetched = true,
 ): { summary: string; nextStep: string } {
     const itemCount = dataset?.itemCount;
     const datasetId = dataset?.id;
@@ -499,18 +501,21 @@ function buildSucceededSummaryNextStep(
     // datasetId known but metadata unavailable (transient fetch failure on a terminal run). Don't
     // claim "no output found" — point the agent at dataset items so they can verify directly.
     if (itemCount === undefined && datasetId) {
+        const metadataMsg = datasetMetadataFetched ? ' Dataset metadata unavailable.' : '';
         return {
-            summary: `SUCCEEDED in ${runTimeSecs}s. Dataset metadata unavailable.${statusMessageLine(statusMessage)}${kv.summarySuffix}`,
+            summary: `SUCCEEDED in ${runTimeSecs}s.${metadataMsg}${statusMessageLine(statusMessage)}${kv.summarySuffix}`,
             nextStep: `Use ${HELPER_TOOLS.DATASET_GET_ITEMS} with datasetId=${datasetId} and limit (for example ${DEFAULT_DATASET_ITEMS_LIMIT}) to inspect output.`,
         };
     }
 
-    // Metadata can report itemCount === 0 briefly after SUCCEEDED (eventual consistency). Surface the
-    // same fetch-first guidance as TIMED-OUT with an empty partial dataset — never imply "re-run only".
+    // Metadata can report itemCount === 0 after SUCCEEDED even past the lag-fallback probe window
+    // (eventual consistency). The zero is unverified, so the summary must not state "no items" as a
+    // conclusion — agents quote the summary and give up on it (observed in web-fetch evals: a run
+    // with an item was reported as blocked). The nextStep is the only place a conclusion may form.
     if (itemCount === 0 && datasetId) {
         return {
-            summary: `SUCCEEDED in ${runTimeSecs}s. No dataset items found.${statusMessageLine(statusMessage)}${kv.summarySuffix}`,
-            nextStep: `Use ${HELPER_TOOLS.DATASET_GET_ITEMS} with datasetId=${datasetId} and limit (for example ${DEFAULT_DATASET_ITEMS_LIMIT}) to verify output (metadata reports 0 items).${fieldsProjectionHint(dataset?.fields)}`,
+            summary: `SUCCEEDED in ${runTimeSecs}s. Dataset item count reads 0 - counts can lag right after a run finishes.${statusMessageLine(statusMessage)}${kv.summarySuffix}`,
+            nextStep: `Fetch ${HELPER_TOOLS.DATASET_GET_ITEMS} with datasetId=${datasetId} and limit (for example ${DEFAULT_DATASET_ITEMS_LIMIT}) before concluding the run produced no output.${fieldsProjectionHint(dataset?.fields)}`,
         };
     }
 
@@ -554,13 +559,19 @@ function buildTimedOutSummaryNextStep(
 
 /**
  * Build {summary, nextStep} per status. Returns one primary action — never two.
+ *
+ * Every observed terminal status — including FAILED, ABORTED and TIMED-OUT — is a successful
+ * observation, so responses stay `isError: false` and the MCP task lands in `completed`. Task
+ * `failed` is reserved for tool-side failures (auth, validation, network): the agent learning
+ * that a run failed is a normal result, not a protocol error.
  */
 export function buildStatusSummaryNextStep(params: {
     run: ActorRun;
     dataset?: RunDataset;
     keyValueStore?: RunKeyValueStore;
+    datasetMetadataFetched?: boolean;
 }): { summary: string; nextStep: string } {
-    const { run, dataset, keyValueStore } = params;
+    const { run, dataset, keyValueStore, datasetMetadataFetched = true } = params;
     const { id: runId, status, statusMessage } = run;
     // The platform usually populates stats.runTimeSecs on terminal runs, but not always (e.g.
     // ABORTED before stats flushed). Fall back to `elapsedSecs(run)` so summaries don't render
@@ -589,7 +600,13 @@ export function buildStatusSummaryNextStep(params: {
                 nextStep: `${pollHint(runId)} observe terminal state.`,
             };
         case 'SUCCEEDED':
-            return buildSucceededSummaryNextStep(runTimeSecs, statusMessage, dataset, keyValueStore);
+            return buildSucceededSummaryNextStep(
+                runTimeSecs,
+                statusMessage,
+                dataset,
+                keyValueStore,
+                datasetMetadataFetched,
+            );
         case 'FAILED':
             return {
                 summary: `FAILED after ${runTimeSecs}s.${statusMessageLine(statusMessage)}`,
@@ -663,6 +680,8 @@ async function waitForRunWithProgress(opts: {
 
     if ((waitSecs === undefined || waitSecs > 0) && !TERMINAL_RUN_STATUSES.has(run.status)) {
         if (progressTracker) {
+            // Before the first updateProgress() call, so it's on every notification.
+            progressTracker.setRunId(runId);
             const trackerLabel = (await actorNamePromise) ?? 'actor';
             await progressTracker.updateProgress(formatRunStatusMessage(trackerLabel, run));
             progressTracker.startActorRunUpdates(runId, client, trackerLabel, run);
@@ -708,24 +727,11 @@ async function waitForRunWithProgress(opts: {
 // -----------------------------------------------------------------------------
 
 /**
- * Build a RunResponse from an already-started ActorRun without waiting.
- * Used when waitSecs=0 (default and apps modes) and by widget variants that return immediately.
- * Storage metadata contains IDs only; pollers/widgets fetch updates via get-actor-run.
- *
- * Pass `widget: true` for widget-rendered responses: nextStep is replaced with a no-poll
- * message and widget _meta is included so the UI renders automatically.
- *
- * Invariant: `widget: true` is only valid from `*-widget` tools. Non-widget tools (call-actor,
- * direct actor tools) must omit it or pass `false`.
+ * Shared construction for the immediate start response, used by both the base and widget
+ * builders below. Returns the full `RunResponse` with the computed (non-widget) `nextStep`;
+ * `buildStartRunWidgetResponse` overrides `nextStep` on its own copy.
  */
-export function buildStartRunResponse(params: {
-    actorName: string;
-    actorRun: ActorRun;
-    widget?: boolean;
-    linkContext?: ConsoleLinkContext;
-}): ReturnType<typeof buildMCPResponse> {
-    const { actorName, actorRun, widget, linkContext } = params;
-
+function buildStartRunSharedContent(actorName: string, actorRun: ActorRun): RunResponse {
     // Start path returns before any metadata fetch, so every entry — default and aliases — is id-only.
     const datasetIds = buildStorageAliasIds(actorRun.storageIds?.datasets, actorRun.defaultDatasetId ?? undefined);
     const kvIds = buildStorageAliasIds(
@@ -739,15 +745,13 @@ export function buildStartRunResponse(params: {
         Object.fromEntries(Object.entries(kvIds).map(([alias, id]) => [alias, { id }])),
     );
 
-    const { summary, nextStep: computedNextStep } = buildStatusSummaryNextStep({
+    const { summary, nextStep } = buildStatusSummaryNextStep({
         run: actorRun,
         dataset: datasets?.default,
         keyValueStore: keyValueStores?.default,
     });
 
-    const nextStep = widget ? WIDGET_NO_POLL_NEXT_STEP : computedNextStep;
-
-    const structuredContent: RunResponse = {
+    return {
         runId: actorRun.id,
         actorId: actorRun.actId,
         actorName,
@@ -760,20 +764,50 @@ export function buildStartRunResponse(params: {
         summary,
         nextStep,
     };
+}
+
+/**
+ * Build a RunResponse from an already-started ActorRun without waiting.
+ * Used when waitSecs=0 (default and apps modes).
+ * Storage metadata contains IDs only; pollers fetch updates via get-actor-run.
+ */
+export function buildStartRunResponse(params: {
+    actorName: string;
+    actorRun: ActorRun;
+    linkContext?: ConsoleLinkContext;
+}): ToolResponse {
+    const { actorName, actorRun, linkContext } = params;
+
+    const structuredContent = buildStartRunSharedContent(actorName, actorRun);
     const consoleLinks = applyConsoleLinks(structuredContent, linkContext);
 
-    const widgetMeta = widget
-        ? {
-              ...(getWidgetConfig(WIDGET_URIS.ACTOR_RUN)?.meta ?? {}),
-              'openai/widgetDescription': `Actor run progress for ${actorName}`,
-          }
-        : undefined;
+    return respondOk(
+        [
+            JSON.stringify(structuredContent),
+            `${structuredContent.summary}\n${structuredContent.nextStep}${consoleLinks}`,
+        ],
+        { structuredContent },
+    );
+}
 
-    return buildMCPResponse({
-        texts: [JSON.stringify(structuredContent), `${summary}\n${nextStep}${consoleLinks}`],
-        structuredContent,
-        ...(widgetMeta && { _meta: widgetMeta }),
-    });
+/**
+ * Build a RunResponse from an already-started ActorRun for widget-rendered responses:
+ * nextStep is replaced with a no-poll message and widget _meta is included so the UI renders
+ * automatically. Used only by `*-widget` tools.
+ */
+export function buildStartRunWidgetResponse(params: { actorName: string; actorRun: ActorRun }): ToolResponse {
+    const { actorName, actorRun } = params;
+
+    const base = buildStartRunSharedContent(actorName, actorRun);
+    const structuredContent = { ...base, nextStep: WIDGET_NO_POLL_NEXT_STEP };
+
+    return respondOk(
+        [JSON.stringify(structuredContent), `${structuredContent.summary}\n${structuredContent.nextStep}`],
+        {
+            structuredContent,
+            meta: buildActorRunWidgetMeta(actorName),
+        },
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -803,7 +837,7 @@ export async function fetchActorRunData(params: {
     abortSignal?: AbortSignal;
     mcpSessionId?: string;
     onAbort?: (runId: string, client: ApifyClient) => Promise<void>;
-}): Promise<{ error: object } | { aborted: true } | { result: FetchActorRunResult }> {
+}): Promise<{ error: ToolResponse } | { aborted: true } | { result: FetchActorRunResult }> {
     const { runId, waitSecs, client, progressTracker, abortSignal, mcpSessionId, onAbort } = params;
 
     const waitResult = await waitForRunWithProgress({
@@ -819,11 +853,7 @@ export async function fetchActorRunData(params: {
     if (waitResult.kind === 'aborted') return { aborted: true };
     if (waitResult.kind === 'not-found') {
         return {
-            error: buildMCPResponse({
-                texts: [`Run with ID '${runId}' not found.`],
-                isError: true,
-                telemetry: { toolStatus: TOOL_STATUS.SOFT_FAIL, failureCategory: FAILURE_CATEGORY.INVALID_INPUT },
-            }),
+            error: respondUserError(`Run with ID '${runId}' not found.`),
         };
     }
     const { run, actorName } = waitResult;

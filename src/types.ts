@@ -1,7 +1,5 @@
 import type { TaskStore } from '@modelcontextprotocol/sdk/experimental/tasks/interfaces.js';
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
-import type { InitializeRequest, Notification, Prompt, Request, ToolSchema } from '@modelcontextprotocol/sdk/types.js';
+import type { InitializeRequest, Prompt, ToolSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ValidateFunction } from 'ajv';
 import type {
     Actor as ActorOutdated,
@@ -15,9 +13,9 @@ import type z from 'zod';
 
 import type { ApifyClient } from './apify_client.js';
 import type { FAILURE_CATEGORY, TELEMETRY_ENV, TOOL_STATUS } from './const.js';
-import type { ActorsMcpServer } from './mcp/server.js';
 import type { PaymentProvider } from './payments/types.js';
 import type { CATEGORY_NAMES } from './tools/registry.js';
+import type { ToolResponse } from './utils/mcp.js';
 import type { PricingTier, StructuredPricingInfo } from './utils/pricing_info.js';
 import type { ProgressTracker } from './utils/progress.js';
 
@@ -84,6 +82,17 @@ export type ActorDefinitionWithInfo = {
 };
 
 /**
+ * Session context a {@link ToolBase.buildDescription} renders against.
+ */
+export type ToolDescriptionContext = {
+    /** Whether the named tool is served in the same tools/list as this tool. */
+    hasTool: (name: string) => boolean;
+};
+
+/** Renders every cross-tool reference as present — for building `description` at module load. */
+export const ALL_TOOLS_PRESENT: ToolDescriptionContext = { hasTool: () => true };
+
+/**
  * Base type for all tools in the MCP server.
  * Extends the MCP SDK's Tool schema, which requires inputSchema to have type: "object".
  * Adds ajvValidate for runtime validation.
@@ -93,6 +102,12 @@ export type ToolBase = z.infer<typeof ToolSchema> & {
     ajvValidate: ValidateFunction;
     /** Whether this tool requires payment validation before execution */
     paymentRequired?: boolean;
+    /**
+     * Session-exact description builder for descriptions that reference sibling tools.
+     * `description` must hold the {@link ALL_TOOLS_PRESENT} render for consumers without a
+     * session tool set. Resolved at the tools/list boundary in `getToolPublicFieldOnly`.
+     */
+    buildDescription?: (ctx: ToolDescriptionContext) => string;
 };
 
 /**
@@ -141,29 +156,24 @@ export type ActorTool = ToolBase & {
 };
 
 /**
- * Arguments passed to internal tool calls.
- * Contains both the tool arguments and server references.
+ * Arguments passed to internal tool calls. Protocol-neutral: plain values the tool bodies read,
+ * no v1 SDK request context or facade reference.
  */
 export type InternalToolArgs = {
     /** Arguments passed to the tool (payment fields already stripped by the server) */
     args: Record<string, unknown>;
-    /** MCP request `_meta` field — used by payment providers that read from metadata (e.g., x402) */
-    meta?: Record<string, unknown>;
-    /** Extra data given to request handlers.
-     *
-     * Can be used to send notifications from the server to the client.
-     *
-     * For more details see: https://github.com/modelcontextprotocol/typescript-sdk/blob/f822c1255edcf98c4e73b9bf17a9dd1b03f86716/src/shared/protocol.ts#L102
-     */
-    extra: RequestHandlerExtra<Request, Notification>;
-    /** Reference to the Apify MCP server instance */
-    apifyMcpServer: ActorsMcpServer;
-    /** Reference to the MCP server instance */
-    mcpServer: Server;
+    /** Abort signal for the call: the request signal for sync calls, the cancel-watcher signal for tasks. */
+    signal: AbortSignal;
     /** Apify API token */
     apifyToken: string;
     /** ApifyClient pre-configured with payment headers (if applicable) or standard token. */
     apifyClient: ApifyClient;
+    /** External store for Actor metadata (output schemas); only set in hosted deployments. */
+    actorStore?: ActorStore;
+    /** Payment provider for agentic payment modes (Skyfire, x402), when configured. */
+    paymentProvider?: PaymentProvider;
+    /** Names of all currently loaded tools. */
+    loadedToolNames: readonly string[];
     /** Optional progress tracker for long running internal tools, like call-actor */
     progressTracker?: ProgressTracker | null;
     /** MCP session ID for logging context */
@@ -184,7 +194,7 @@ export type HelperTool = ToolBase & {
      * @param toolArgs - Arguments and server references
      * @returns Promise resolving to the tool's output
      */
-    call: (toolArgs: InternalToolArgs) => Promise<object>;
+    call: (toolArgs: InternalToolArgs) => Promise<ToolResponse>;
 };
 
 /**
@@ -198,11 +208,6 @@ export type ActorMcpTool = ToolBase & {
     originToolName: string;
     /** ID of the Actorized MCP server - for example, apify/actors-mcp-server */
     actorId: string;
-    /**
-     * ID of the Actorized MCP server the tool is associated with.
-     * serverId is generated unique ID based on the serverUrl.
-     */
-    serverId: string;
     /** Connection URL of the Actorized MCP server */
     serverUrl: string;
 };
@@ -230,11 +235,6 @@ export type Input = {
      * Otherwise, the specified Actors should be loaded.
      */
     actors?: string[] | string;
-    /**
-     * @deprecated Use `enableAddingActors` instead.
-     */
-    enableActorAutoLoading?: boolean | string;
-    enableAddingActors?: boolean | string;
     maxActorMemoryBytes?: number;
     /**
      * Tool selectors to include (category keys or concrete tool names).
@@ -303,20 +303,6 @@ export type Actor = ActorOutdated & {
     };
 };
 
-export type ActorDefinitionStorage = {
-    views: Record<
-        string,
-        {
-            transformation: {
-                fields?: string[];
-            };
-            display: {
-                properties: Record<string, object>;
-            };
-        }
-    >;
-};
-
 export type ApifyDocsSearchResult = {
     /** URL of the documentation page, may include anchor (e.g., https://docs.apify.com/actors#build-actors) */
     url: string;
@@ -335,7 +321,6 @@ export type PromptBase = Prompt & {
     render: (args: Record<string, string>) => string;
 };
 
-export type DatasetItem = Record<number | string, unknown>;
 /**
  * Apify token type.
  *
@@ -386,6 +371,27 @@ export type ToolCallTelemetryProperties = {
     validation_missing_property?: string;
     validation_additional_property?: string;
     validation_error_count?: number;
+};
+
+/**
+ * Segment 'MCP Reported Problem' event payload: the `report-problem` submission plus the same
+ * session/client context carried by {@link ToolCallTelemetryProperties}. A downstream Segment
+ * destination consumes this event for Slack/GitHub fan-out.
+ */
+export type ReportedProblemTelemetryProperties = Pick<
+    ToolCallTelemetryProperties,
+    | 'app'
+    | 'app_version'
+    | 'mcp_client_name'
+    | 'mcp_client_version'
+    | 'mcp_protocol_version'
+    | 'mcp_session_id'
+    | 'transport_type'
+> & {
+    message: string;
+    actor_id?: string;
+    actor_run_id?: string;
+    related_tools?: string[];
 };
 
 export type AjvErrorDetails = Pick<
@@ -462,6 +468,8 @@ export type ServerModeOption = SERVER_MODE | 'auto';
 export type ActorExecutionParams = {
     /** Full name of the Actor (e.g., "apify/rag-web-browser") */
     actorFullName: string;
+    /** Actor's platform ID — echoed into telemetry on a platform input-validation error. */
+    actorId?: string;
     /** Input to pass to the Actor (payment fields already stripped) */
     input: Record<string, unknown>;
     /** Apify client (may include payment headers) */
@@ -519,14 +527,11 @@ export type ActorExecutor = {
  */
 export type ActorStore = {
     /**
-     * Returns the inferred JSON Schema properties for an Actor's dataset items,
-     * based on historical successful runs.
-     *
-     * The returned object should be a JSON Schema `properties` object, e.g.:
+     * Returns the inferred JSON Schema `properties` object for an Actor's dataset items, e.g.:
      * `{ url: { type: 'string' }, price: { type: 'number' } }`
      *
-     * Returns null if no schema is available (e.g., new Actor with no runs).
-     * Internally calls `getActorOutputSchemaAsTypeObject` and converts the result.
+     * Converts the result of {@link ActorStore.getActorOutputSchemaAsTypeObject} — same source
+     * (historical successful runs) and same null contract.
      *
      * @param actorFullName - Full Actor name in "username/name" format (e.g., "apify/rag-web-browser")
      */
@@ -548,6 +553,11 @@ export type ActorStore = {
      */
     getActorOutputSchemaAsTypeObject(actorFullName: string): Promise<Record<string, unknown> | null>;
 };
+
+/**
+ * How the server is connected: 'stdio' (direct/local) or 'http' (remote HTTP streamable).
+ */
+export type TransportType = 'stdio' | 'http';
 
 /**
  * Options for configuring the ActorsMcpServer instance.
@@ -601,7 +611,7 @@ export type ActorsMcpServerOptions = {
      * - 'stdio': Direct/local stdio connection
      * - 'http': Remote HTTP streamable connection
      */
-    transportType?: 'stdio' | 'http';
+    transportType?: TransportType;
     /**
      * Apify API token for authentication
      * Primarily used by stdio transport when token is read from ~/.apify/auth.json file
@@ -645,7 +655,6 @@ export type StructuredActorCard = {
     stats?: {
         totalUsers: number;
         monthlyUsers: number;
-        successRate?: number;
         bookmarks?: number;
     };
     rating?: {
@@ -736,7 +745,7 @@ export type ServerCard = {
         endpoint: string;
     };
     capabilities: {
-        tools: { listChanged: boolean };
+        tools: Record<string, never>;
     };
     authentication: {
         required: boolean;

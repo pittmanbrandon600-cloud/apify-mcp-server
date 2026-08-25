@@ -2,6 +2,135 @@
 
 All notable changes to this project will be documented in this file.
 
+<!-- git-cliff-unreleased-start -->
+## 0.15.2 - **not yet released**
+
+### 🚀 Features
+
+- Prefix MCP-proxied tool names with Actor tool name ([#1279](https://github.com/apify/apify-mcp-server/pull/1279)) ([145460d](https://github.com/apify/apify-mcp-server/commit/145460d8363acd43e09cc49922a3d3464a6e3c8d)) by [@jirispilka](https://github.com/jirispilka), closes [#1277](https://github.com/apify/apify-mcp-server/issues/1277)
+- **evals:** Trace the agent conversation to Langfuse ([#1239](https://github.com/apify/apify-mcp-server/pull/1239)) ([0396e67](https://github.com/apify/apify-mcp-server/commit/0396e67f679011838927661b315231c6d3dd188a)) by [@RobertCrupa](https://github.com/RobertCrupa)
+
+
+<!-- git-cliff-unreleased-end -->
+## [0.15.1](https://github.com/apify/apify-mcp-server/releases/tag/v0.15.1) (2026-08-20)
+
+### 🚀 Features
+
+- Add actor tasks ([#1235](https://github.com/apify/apify-mcp-server/pull/1235)) ([8d3da8d](https://github.com/apify/apify-mcp-server/commit/8d3da8d5ecf8b5859a603ac85a3738fc59e6f5da)) by [@Janjiran](https://github.com/Janjiran), closes [#29471](https://github.com/apify/apify-mcp-server/issues/29471)
+- Extend official Apify usernames beyond apify ([#1285](https://github.com/apify/apify-mcp-server/pull/1285)) ([68ebec3](https://github.com/apify/apify-mcp-server/commit/68ebec318bc2fe4d86a88845027ceb10d4fdaf2b)) by [@MQ37](https://github.com/MQ37)
+
+### 🐛 Bug Fixes
+
+- Return not-found error from get-actor-log for missing runs ([#1234](https://github.com/apify/apify-mcp-server/pull/1234)) ([702ab5e](https://github.com/apify/apify-mcp-server/commit/702ab5efa9887fefa308304175eda3da3552441f)) by [@jirispilka](https://github.com/jirispilka), closes [#1193](https://github.com/apify/apify-mcp-server/issues/1193)
+
+
+## [0.15.0](https://github.com/apify/apify-mcp-server/releases/tag/v0.15.0) (2026-08-19)
+
+### 🚀 Features
+
+- [**breaking**] Run workflow evals as Langfuse experiments ([#1224](https://github.com/apify/apify-mcp-server/pull/1224)) ([316d640](https://github.com/apify/apify-mcp-server/commit/316d6404e50af2ead4770a94a96168ae4f0bfa5d)) by [@RobertCrupa](https://github.com/RobertCrupa)
+- **evals:** Run workflow evals on the Claude Agent SDK ([#1238](https://github.com/apify/apify-mcp-server/pull/1238)) ([de46c3e](https://github.com/apify/apify-mcp-server/commit/de46c3eff0af721192b3fd5fca80e044e9aef81b)) by [@RobertCrupa](https://github.com/RobertCrupa)
+
+### 🐛 Bug Fixes
+
+- Stop filterSchemaProperties from writing phantom default&#x2F;prefill keys ([#1257](https://github.com/apify/apify-mcp-server/pull/1257)) ([db7a7ce](https://github.com/apify/apify-mcp-server/commit/db7a7cea53b8f9e0a9e149c7fd40048f05cd23ac)) by [@MQ37](https://github.com/MQ37), closes [#1266](https://github.com/apify/apify-mcp-server/issues/1266)
+- Correct tool descriptions naming absent tools or wrong output ([#1261](https://github.com/apify/apify-mcp-server/pull/1261)) ([c5d3928](https://github.com/apify/apify-mcp-server/commit/c5d3928b1cb9e0f4b9891ad015411c6472c26e70)) by [@jirispilka](https://github.com/jirispilka)
+
+
+## [0.14.3](https://github.com/apify/apify-mcp-server/releases/tag/v0.14.3) (2026-08-12)
+
+### 🚀 Features
+
+- Trace workflow evals to Langfuse ([#1223](https://github.com/apify/apify-mcp-server/pull/1223)) ([8280936](https://github.com/apify/apify-mcp-server/commit/8280936157946ca5954618a59deed1c46778e117)) by [@RobertCrupa](https://github.com/RobertCrupa)
+
+### 🐛 Bug Fixes
+
+- Recover widget structuredContent stripped by Claude Desktop ([#1187](https://github.com/apify/apify-mcp-server/pull/1187)) ([94dcfe3](https://github.com/apify/apify-mcp-server/commit/94dcfe3b13e0baef94f1d0f5155f0044b02f42df)) by [@jirispilka](https://github.com/jirispilka)
+- Align Node floor to 22 and drop dead smithery.yaml ([#1210](https://github.com/apify/apify-mcp-server/pull/1210)) ([6c4ac08](https://github.com/apify/apify-mcp-server/commit/6c4ac08c6a7e3b11d075dd7d1684d05599a50728)) by [@jirispilka](https://github.com/jirispilka)
+- Normalize judge verdict casing instead of erroring the item ([#1222](https://github.com/apify/apify-mcp-server/pull/1222)) ([51baeb4](https://github.com/apify/apify-mcp-server/commit/51baeb412925154c45678b5f73dac18f2c544b7e)) by [@RobertCrupa](https://github.com/RobertCrupa)
+- Hardcode apify&#x2F;code-runtime Actor ID for full-README bypass ([#1123](https://github.com/apify/apify-mcp-server/pull/1123)) ([3647cc4](https://github.com/apify/apify-mcp-server/commit/3647cc4a219a679db43f14ff52ed613dfb65936e)) by [@MQ37](https://github.com/MQ37)
+
+
+## [0.14.2](https://github.com/apify/apify-mcp-server/releases/tag/v0.14.2) (2026-08-05)
+
+### 🐛 Bug Fixes
+
+- Parallelize integration test suite ([#1137](https://github.com/apify/apify-mcp-server/pull/1137)) ([a42e66f](https://github.com/apify/apify-mcp-server/commit/a42e66f6cedf9419f9d9e6213579050bb1774949)) by [@MQ37](https://github.com/MQ37)
+- Honor AbortSignal on Actor-MCP calls and hash-dedupe proxy names ([#1185](https://github.com/apify/apify-mcp-server/pull/1185)) ([7b24c9e](https://github.com/apify/apify-mcp-server/commit/7b24c9e3609958f276d00f9547d61a2c6773f379)) by [@Ayush7614](https://github.com/Ayush7614)
+- Stop reporting a cancelled Actor-MCP call as a failure ([#1197](https://github.com/apify/apify-mcp-server/pull/1197)) ([cbbfb79](https://github.com/apify/apify-mcp-server/commit/cbbfb79b0aa4c0e426fcf328b484325e76717f4c)) by [@vojtechj-apify](https://github.com/vojtechj-apify)
+
+
+## [0.14.1](https://github.com/apify/apify-mcp-server/releases/tag/v0.14.1) (2026-07-31)
+
+### 🚀 Features
+
+- Add outputSchema to report-problem and get-actor-log ([#1175](https://github.com/apify/apify-mcp-server/pull/1175)) ([21bb370](https://github.com/apify/apify-mcp-server/commit/21bb370170b811b665ba869240862f2c854819df)) by [@jirispilka](https://github.com/jirispilka), closes [#1159](https://github.com/apify/apify-mcp-server/issues/1159), [#1160](https://github.com/apify/apify-mcp-server/issues/1160)
+
+### 🐛 Bug Fixes
+
+- Remove gameable Runs succeeded stat from actor search&#x2F;details ([#1182](https://github.com/apify/apify-mcp-server/pull/1182)) ([7142233](https://github.com/apify/apify-mcp-server/commit/7142233d5fca240b1094b516d3d6972a4d35d586)) by [@MQ37](https://github.com/MQ37)
+
+
+## [0.14.0](https://github.com/apify/apify-mcp-server/releases/tag/v0.14.0) (2026-07-29)
+
+### 🚀 Features
+
+- Serve 2026-07-28 MCP requests from a stateless adapter ([#1165](https://github.com/apify/apify-mcp-server/pull/1165)) ([6aae6c7](https://github.com/apify/apify-mcp-server/commit/6aae6c722020b0fc06915ffc11a32420e9edb510)) by [@jirispilka](https://github.com/jirispilka), closes [#1140](https://github.com/apify/apify-mcp-server/issues/1140)
+
+### 🐛 Bug Fixes
+
+- Drop validator nulling in close() that threw on frozen entries ([#1163](https://github.com/apify/apify-mcp-server/pull/1163)) ([9d0acda](https://github.com/apify/apify-mcp-server/commit/9d0acda8aa2dc00241c14d703f5b8a89007e0589)) by [@jirispilka](https://github.com/jirispilka)
+
+### 🚜 Refactor
+
+- [**breaking**] Separate legacy MCP wiring from ActorsMcpServer ([#1155](https://github.com/apify/apify-mcp-server/pull/1155)) ([5ebe0d8](https://github.com/apify/apify-mcp-server/commit/5ebe0d84cdaa1c0cc10d86b65c78c61c609f7fae)) by [@jirispilka](https://github.com/jirispilka), closes [#1147](https://github.com/apify/apify-mcp-server/issues/1147)
+
+
+## [0.13.0](https://github.com/apify/apify-mcp-server/releases/tag/v0.13.0) (2026-07-27)
+
+### 🚀 Features
+
+- [**breaking**] Delete add-actor implementation (stateless migration PR 2) ([#1144](https://github.com/apify/apify-mcp-server/pull/1144)) ([4562136](https://github.com/apify/apify-mcp-server/commit/4562136999ddb2377949992e73226266c8ae08a1)) by [@MQ37](https://github.com/MQ37), closes [#1131](https://github.com/apify/apify-mcp-server/issues/1131)
+
+
+## [0.12.0](https://github.com/apify/apify-mcp-server/releases/tag/v0.12.0) (2026-07-23)
+
+### 🚀 Features
+
+- Attribute Apify AI runs with the APIFY_AI origin ([#1117](https://github.com/apify/apify-mcp-server/pull/1117)) ([780fd40](https://github.com/apify/apify-mcp-server/commit/780fd40a7707633b1dcfc8060cc906fb4f8bd5b3)) by [@jirispilka](https://github.com/jirispilka)
+- [**breaking**] Cut off add-actor tool selection, substitute call-actor ([#1127](https://github.com/apify/apify-mcp-server/pull/1127)) ([432289e](https://github.com/apify/apify-mcp-server/commit/432289ebdf6ab08a88f76e3e29df4ea14b4544e2)) by [@MQ37](https://github.com/MQ37), closes [#1129](https://github.com/apify/apify-mcp-server/issues/1129)
+
+
+## [0.11.7](https://github.com/apify/apify-mcp-server/releases/tag/v0.11.7) (2026-07-21)
+
+### 🚀 Features
+
+- Storage as resources ([#1003](https://github.com/apify/apify-mcp-server/pull/1003)) ([b46668b](https://github.com/apify/apify-mcp-server/commit/b46668bd98a14e776e6e86ecb2e6f0d43d86dbd5)) by [@RobertCrupa](https://github.com/RobertCrupa)
+- Unify storage tool descriptions (#885) ([#1089](https://github.com/apify/apify-mcp-server/pull/1089)) ([1d34dbf](https://github.com/apify/apify-mcp-server/commit/1d34dbfc0d01fefccc1900bd2aa62daad3532bb4)) by [@jirispilka](https://github.com/jirispilka), closes [#885](https://github.com/apify/apify-mcp-server/issues/885)
+
+### 🐛 Bug Fixes
+
+- Propagate auth errors instead of reporting Actor not found ([#1102](https://github.com/apify/apify-mcp-server/pull/1102)) ([fa5c3db](https://github.com/apify/apify-mcp-server/commit/fa5c3db718c4fbe22572012bacc1104d61303ed7)) by [@MQ37](https://github.com/MQ37)
+- SoftFail observed Mezmo client and upstream noise ([#1118](https://github.com/apify/apify-mcp-server/pull/1118)) ([9684988](https://github.com/apify/apify-mcp-server/commit/9684988453e588d72b05798ca97505715cc89b08)) by [@jirispilka](https://github.com/jirispilka)
+
+
+## [0.11.6](https://github.com/apify/apify-mcp-server/releases/tag/v0.11.6) (2026-07-16)
+
+### 🚀 Features
+
+- Add report-problem tool for agents to report issues ([#1050](https://github.com/apify/apify-mcp-server/pull/1050)) ([76586f4](https://github.com/apify/apify-mcp-server/commit/76586f4dd9f3c3c5cdbbde02c38e4d0ad562a360)) by [@RobertCrupa](https://github.com/RobertCrupa), closes [#748](https://github.com/apify/apify-mcp-server/issues/748)
+
+### 🐛 Bug Fixes
+
+- Resolve pre-flight task failures synchronously ([#1080](https://github.com/apify/apify-mcp-server/pull/1080)) ([64905c7](https://github.com/apify/apify-mcp-server/commit/64905c7627a476b04d3a8ce96d30d3c046c1e7b5)) by [@jirispilka](https://github.com/jirispilka), closes [#684](https://github.com/apify/apify-mcp-server/issues/684)
+
+
+## [0.11.5](https://github.com/apify/apify-mcp-server/releases/tag/v0.11.5) (2026-07-08)
+
+
+## [0.11.5](https://github.com/apify/apify-mcp-server/releases/tag/v0.11.5) (2026-07-08)
+
+
 ## [0.11.5](https://github.com/apify/apify-mcp-server/releases/tag/v0.11.5) (2026-07-02)
 
 ### 🚀 Features

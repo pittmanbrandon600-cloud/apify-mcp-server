@@ -1,8 +1,10 @@
 import { ErrorCode } from '@modelcontextprotocol/sdk/types.js';
+import { ZodError } from 'zod';
 
 import log from '@apify/log';
 
 import { SchemaTooLargeError } from '../errors.js';
+import { SKYFIRE_PAY_ID_KEY } from '../payments/const.js';
 import { isActorRunLimitError } from './apify_errors.js';
 
 /**
@@ -53,6 +55,7 @@ export function sanitizeMezmoMessage(message: string): string {
 const MCP_CLIENT_FAULT_MESSAGES: ReadonlySet<string> = new Set([
     'Bad Request: Server not initialized',
     'Invalid Request: Only one initialization request is allowed',
+    'Invalid Request: Server already initialized',
     'Not Acceptable: Client must accept text/event-stream',
     'Not Acceptable: Client must accept both application/json and text/event-stream',
     'Parse error: Invalid JSON',
@@ -67,7 +70,34 @@ const MCP_CLIENT_FAULT_PREFIXES: readonly string[] = [
     'Failed to send response: Error: No connection established for request ID:', // send-path wrap of the above
     'Failed to send response: Error: Not connected', // send-path wrap
     'Invalid state: Controller is already closed', // Node web-streams ERR_INVALID_STATE
+    // Clients/proxies sometimes send duplicate mcp-protocol-version headers; Headers.get joins them
+    // with ", " so a supported version becomes e.g. "2025-11-25, 2025-11-25" and fails includes().
+    'Bad Request: Unsupported protocol version:',
 ];
+
+/**
+ * Remote Actor MCP / docs transport failures observed in production Mezmo. Often wrapped as
+ * HTTP 500 by the MCP SDK ("Streamable HTTP error: …"). Match as substrings, case-insensitive.
+ * Do not broaden without a real log sample.
+ */
+const TRANSIENT_UPSTREAM_MESSAGE_PATTERNS: readonly RegExp[] = [/socket hang up/i, /gateway time-?out/i];
+
+/**
+ * True when an error is a Zod parse failure (our ZodError, or SDK Zod 4's `$ZodError` shape).
+ * Untrusted Actor MCP `tools/list` payloads that omit `inputSchema` land here — Actor bug, not ours.
+ */
+function isZodValidationError(error: unknown): boolean {
+    if (error instanceof ZodError) return true;
+    if (typeof error !== 'object' || error === null) return false;
+    const { name, issues } = error as { name?: unknown; issues?: unknown };
+    return (name === 'ZodError' || name === '$ZodError') && Array.isArray(issues);
+}
+
+/** True when the failure matches an observed transient upstream/network message. */
+function isTransientUpstreamError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return TRANSIENT_UPSTREAM_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
+}
 
 /** True when an MCP SDK `onerror` message is a known client fault that should softFail, not error. */
 export function isMcpClientFaultMessage(message: string): boolean {
@@ -101,6 +131,8 @@ function getMcpErrorCode(error: unknown): number | undefined {
 /**
  * Logs HTTP or MCP errors at the appropriate level:
  * - Client errors (HTTP < 500, or JSON-RPC client/transient codes) → softFail (no stack).
+ * - Zod validation / SchemaTooLarge / Actor run-limit → softFail (untrusted input or billing).
+ * - Transient upstream (socket hang up, gateway timeout) → softFail.
  * - Server errors (HTTP >= 500, or JSON-RPC server codes) → exception (with stack).
  * - Anything unclassifiable → error.
  *
@@ -122,6 +154,22 @@ export function logHttpError<T extends object>(error: unknown, message: string, 
     // Oversized untrusted input schema — a property of the Actor's schema, not a server fault.
     if (error instanceof SchemaTooLargeError) {
         log.softFail(message, { errMessage: softErrMessage, ...data });
+        return;
+    }
+
+    // Zod parse failures on untrusted remote MCP payloads (e.g. tools/list missing inputSchema).
+    if (isZodValidationError(error)) {
+        log.softFail(message, { errMessage: softErrMessage, ...data });
+        return;
+    }
+
+    // Transient upstream/network: docs CDN / Actor MCP socket hang up or gateway timeout.
+    if (isTransientUpstreamError(error)) {
+        log.softFail(message, {
+            errMessage: softErrMessage,
+            ...(statusCode !== undefined ? { statusCode } : {}),
+            ...data,
+        });
         return;
     }
 
@@ -152,7 +200,6 @@ export function logHttpError<T extends object>(error: unknown, message: string, 
     log.error(message, { error, ...data });
 }
 
-const SKYFIRE_PAY_ID_KEY = 'skyfire-pay-id';
 const REDACTED_VALUE = '[REDACTED]';
 
 const isPlainRecord = (value: unknown): value is Record<string, unknown> => {

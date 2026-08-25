@@ -1,10 +1,30 @@
-import { FAILURE_CATEGORY, HELPER_TOOLS, TOOL_STATUS } from '../../const.js';
+import { HELPER_TOOLS, HTTP_NOT_FOUND, MAX_INLINE_BYTES } from '../../const.js';
 import { VERBATIM_LINKS_NUDGE } from '../../utils/console_link.js';
-import { encodeToon } from '../../utils/encode_text.js';
 import { QUOTE_WRAPPER_CHARS } from '../../utils/generic.js';
-import { buildMCPResponse } from '../../utils/mcp.js';
+import { getHttpStatusCode } from '../../utils/logging.js';
+import { respondOk } from '../../utils/mcp.js';
 
-function suggestTool(toolName: string, loadedToolNames: string[]): string | undefined {
+/**
+ * Wrap a storage SDK promise to convert a 404 rejection into null.
+ *
+ * The Apify SDK soft-catches 404 on `.get()`, `.getStatistics()`, and `.getRecord()` (returning
+ * falsy instead of throwing), but list methods like `.listItems()` and `.listKeys()` throw
+ * ApifyApiError on a missing storage. This helper wraps those list calls to provide consistent
+ * 404 handling: resolves with the promise's value, returns null if it rejects with a 404, or
+ * rethrows any other error. Call sites check `if (!result) return respondUserError(...)` as usual.
+ */
+export async function catchNotFound<T>(promise: Promise<T>): Promise<T | null> {
+    try {
+        return await promise;
+    } catch (err: unknown) {
+        if (getHttpStatusCode(err) === HTTP_NOT_FOUND) {
+            return null;
+        }
+        throw err;
+    }
+}
+
+function suggestTool(toolName: string, loadedToolNames: readonly string[]): string | undefined {
     return loadedToolNames.includes(toolName) ? toolName : undefined;
 }
 
@@ -28,45 +48,26 @@ export function buildConsoleLinkContent(apifyConsoleUrl: string | undefined): { 
 }
 
 /**
- * Soft-fail not-found response for storage tools. Centralizes
- * `isError: true` + SOFT_FAIL/INVALID_INPUT telemetry so call sites
- * only supply the message.
- */
-export function buildStorageNotFound(text: string) {
-    return buildMCPResponse({
-        texts: [text],
-        isError: true,
-        telemetry: { toolStatus: TOOL_STATUS.SOFT_FAIL, failureCategory: FAILURE_CATEGORY.INVALID_INPUT },
-    });
-}
-
-/**
  * Build a storage tool response, mirroring `actor_run_response.ts`:
  * `structuredContent` carries the data plus `summary` (and `nextStep` unless terminal).
  * `nextStep` is omitted for terminal responses (e.g. get-key-value-store-record).
  *
- * `toon: true` (the list tools) emits a single text: the data TOON-encoded in a ```toon fence
- * (token-cheaper for uniform-row arrays; `summary`/`nextStep` are prose, not tabular, so they
- * stay out of the fence) followed by `summary`/`nextStep` as plain text. Single-object tools
- * leave it off and ship `content[0]` as the raw-JSON dump of `structuredContent` plus
- * `content[1]` with `summary`/`nextStep`. Either way `structuredContent` is the lossless source
- * of truth — programmatic consumers read it, not `content[]`.
+ * `content[0]` is the JSON-stringified `structuredContent`; `content[1]` carries `summary`/`nextStep`
+ * as plain text. `structuredContent` is the lossless source of truth — programmatic consumers read
+ * it, not `content[]`.
  */
 export function buildStorageResponse(params: {
     structuredContent: Record<string, unknown>;
     summary: string;
     nextStep?: string;
-    toon?: boolean;
     /** Personalized Apify Console link (Console UI token sessions); appended as a trailing text item. */
     apifyConsoleUrl?: string;
 }) {
-    const { structuredContent, summary, nextStep, toon, apifyConsoleUrl } = params;
+    const { structuredContent, summary, nextStep, apifyConsoleUrl } = params;
     const full = { ...structuredContent, summary, ...(nextStep !== undefined && { nextStep }) };
     const summaryText = nextStep !== undefined ? `${summary}\n${nextStep}` : summary;
-    const dataText = toon ? encodeToon(structuredContent) : JSON.stringify(structuredContent);
     const consoleLinkText = apifyConsoleLinkText(apifyConsoleUrl);
-    return buildMCPResponse({
-        texts: [dataText, summaryText, ...(consoleLinkText ? [consoleLinkText] : [])],
+    return respondOk([JSON.stringify(structuredContent), summaryText, ...(consoleLinkText ? [consoleLinkText] : [])], {
         structuredContent: full,
     });
 }
@@ -103,7 +104,7 @@ export function buildDatasetItemsSummaryNextStep(params: {
     totalItemCount: number;
     offset: number;
     /** Active loaded tool set; gates the terminal get-dataset reference (see #1007). */
-    loadedToolNames: string[];
+    loadedToolNames: readonly string[];
 }): { summary: string; nextStep: string } {
     const { datasetId, itemCount, totalItemCount, offset, loadedToolNames } = params;
     if (offset + itemCount < totalItemCount) {
@@ -163,4 +164,36 @@ export function buildKvsKeysSummaryNextStep(params: {
 const NORMALIZE_RECORD_KEY_REGEX = new RegExp(`^[${QUOTE_WRAPPER_CHARS}]+|[${QUOTE_WRAPPER_CHARS}]+$`, 'g');
 export function normalizeRecordKey(key: string): string {
     return key.trim().replace(NORMALIZE_RECORD_KEY_REGEX, '').trim();
+}
+
+/**
+ * How to surface a binary key-value-store record value: inline as base64 below
+ * `MAX_INLINE_BYTES`, otherwise link out (inlining a multi-MB blob would blow up the
+ * client's context). `mimeType` is the Content-Type with parameters stripped and lowercased
+ * (`Image/PNG; charset=…` → `image/png`), or `undefined` when no Content-Type was declared.
+ */
+export type BinaryRecordDisposition =
+    | { kind: 'inline'; mimeType?: string; base64: string }
+    | { kind: 'linkOut'; mimeType?: string; bytes: number };
+
+/**
+ * Base MIME type of a Content-Type header: parameters stripped, lowercased
+ * (`Image/PNG; charset=…` → `image/png`), `undefined` when no header was declared.
+ * Shared by the get-key-value-store-record tool and the API-resource proxy.
+ */
+export function parseBaseMimeType(contentType: string | undefined): string | undefined {
+    return contentType?.split(';')[0].trim().toLowerCase();
+}
+
+/**
+ * Build the transport disposition for a binary record value: normalize the MIME type, decide
+ * inline-vs-link-out at the byte threshold, base64-encode when inlining. It does NOT mint the
+ * link-out URL — the caller handles `linkOut` by minting its own URL via async calls.
+ */
+export function buildBinaryRecordDisposition(contentType: string | undefined, value: Buffer): BinaryRecordDisposition {
+    const mimeType = parseBaseMimeType(contentType);
+    if (value.length > MAX_INLINE_BYTES) {
+        return { kind: 'linkOut', ...(mimeType !== undefined && { mimeType }), bytes: value.length };
+    }
+    return { kind: 'inline', ...(mimeType !== undefined && { mimeType }), base64: value.toString('base64') };
 }

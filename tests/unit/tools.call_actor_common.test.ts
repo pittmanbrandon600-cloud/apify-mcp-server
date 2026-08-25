@@ -1,6 +1,7 @@
+import type { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { ApifyApiError } from 'apify-client';
 import type { AxiosResponse } from 'axios';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
     APIFY_ERROR_TYPE_MEMORY_LIMIT_EXCEEDED,
@@ -8,13 +9,26 @@ import {
     HELPER_TOOLS,
     TOOL_STATUS,
 } from '../../src/const.js';
+import * as mcpClient from '../../src/mcp/client.js';
+import { EXTERNAL_TOOL_CALL_TIMEOUT_MSEC } from '../../src/mcp/const.js';
 import {
     buildCallActorAppsDescription,
     buildCallActorDescription,
     buildCallActorErrorResponse,
-    buildPermissionApprovalResponse,
     callActorArgs,
+    handleMcpToolCall,
+    resolveAndValidateActor,
 } from '../../src/tools/actors/call_actor.js';
+import type { InternalToolArgs, ToolEntry } from '../../src/types.js';
+import { TOOL_TYPE } from '../../src/types.js';
+import { textOf, type TextToolResult } from './helpers/tool_context.js';
+
+vi.mock('../../src/tools/actors/actor_tools_factory.js', async () => {
+    const actual = await vi.importActual<Record<string, unknown>>('../../src/tools/actors/actor_tools_factory.js');
+    return { ...actual, getActorsAsTools: vi.fn() };
+});
+
+const { getActorsAsTools } = await import('../../src/tools/actors/actor_tools_factory.js');
 
 describe('call_actor_common', () => {
     describe('buildCallActorDescription', () => {
@@ -22,13 +36,17 @@ describe('call_actor_common', () => {
             const description = buildCallActorDescription();
 
             expect(description).toContain(`Use ${HELPER_TOOLS.ACTOR_GET_DETAILS} to get the Actor's input schema`);
-            expect(description).toContain(
-                `${HELPER_TOOLS.STORE_SEARCH} is available in this session, use it to resolve the correct Actor first`,
-            );
+            expect(description).toContain(`use ${HELPER_TOOLS.STORE_SEARCH} to resolve the correct Actor first`);
             expect(description).toContain('waitSecs');
             expect(description).toContain(HELPER_TOOLS.DATASET_GET_ITEMS);
             expect(description).not.toContain('always runs asynchronously');
             expect(description).not.toContain(HELPER_TOOLS.ACTOR_CALL_WIDGET);
+        });
+
+        // The waitSecs: 0 path (buildStartRunSharedContent) returns id-only storages and never
+        // reaches buildRunDataset, so the field-metadata promise must stay tied to waitSecs > 0.
+        it('promises dataset field metadata only for a non-zero wait', () => {
+            expect(buildCallActorDescription()).toContain('with waitSecs > 0 also reports dataset field metadata');
         });
     });
 
@@ -52,13 +70,13 @@ describe('call_actor_common', () => {
                 error,
                 actorId: 'actor-123',
                 mcpSessionId: 'session-123',
-                actorGetDetailsTool: HELPER_TOOLS.ACTOR_GET_DETAILS,
+                loadedToolNames: [HELPER_TOOLS.STORE_SEARCH, HELPER_TOOLS.ACTOR_GET_DETAILS],
             });
 
             expect(response.isError).toBe(true);
-            const allText = response.content.map((c) => c.text).join('\n');
-            expect(allText).toContain(`If ${HELPER_TOOLS.STORE_SEARCH} is available in this session`);
-            expect(allText).toContain(`using: ${HELPER_TOOLS.ACTOR_GET_DETAILS}`);
+            const allText = (response.content ?? []).map(textOf).join('\n');
+            expect(allText).toContain(`search for available Actors using ${HELPER_TOOLS.STORE_SEARCH}`);
+            expect(allText).toContain(`get Actor details using ${HELPER_TOOLS.ACTOR_GET_DETAILS}`);
             expect(response.toolTelemetry).toEqual(
                 expect.objectContaining({
                     toolStatus: TOOL_STATUS.SOFT_FAIL,
@@ -91,11 +109,11 @@ describe('call_actor_common', () => {
                 actorName: 'apify/some-actor',
                 error,
                 actorId: 'actor-456',
-                actorGetDetailsTool: HELPER_TOOLS.ACTOR_GET_DETAILS,
+                loadedToolNames: [HELPER_TOOLS.STORE_SEARCH, HELPER_TOOLS.ACTOR_GET_DETAILS],
             });
 
             expect(response.isError).toBe(true);
-            const allText = response.content.map((c) => c.text).join('\n');
+            const allText = (response.content ?? []).map(textOf).join('\n');
             expect(allText).toContain('This Actor requires full access to your account');
             expect(allText).toContain(approvalUrl);
             expect(response.toolTelemetry).toEqual(
@@ -112,12 +130,12 @@ describe('call_actor_common', () => {
             const response = buildCallActorErrorResponse({
                 actorName: 'apify/rag-web-browser',
                 error: new Error('boom'),
-                actorGetDetailsTool: HELPER_TOOLS.ACTOR_GET_DETAILS,
+                loadedToolNames: [HELPER_TOOLS.STORE_SEARCH, HELPER_TOOLS.ACTOR_GET_DETAILS],
             });
 
-            const allText = response.content.map((c) => c.text).join('\n');
-            expect(allText).toContain(`If ${HELPER_TOOLS.STORE_SEARCH} is available in this session`);
-            expect(allText).toContain(`using: ${HELPER_TOOLS.ACTOR_GET_DETAILS}`);
+            const allText = (response.content ?? []).map(textOf).join('\n');
+            expect(allText).toContain(`search for available Actors using ${HELPER_TOOLS.STORE_SEARCH}`);
+            expect(allText).toContain(`get Actor details using ${HELPER_TOOLS.ACTOR_GET_DETAILS}`);
             expect(response.toolTelemetry).toEqual(
                 expect.objectContaining({
                     toolStatus: TOOL_STATUS.FAILED,
@@ -125,6 +143,30 @@ describe('call_actor_common', () => {
                     failureDetail: 'boom',
                 }),
             );
+        });
+
+        it('omits the recovery hint entirely when neither tool is loaded in this session', () => {
+            const response = buildCallActorErrorResponse({
+                actorName: 'apify/rag-web-browser',
+                error: new Error('boom'),
+                loadedToolNames: [],
+            });
+
+            const allText = (response.content ?? []).map(textOf).join('\n');
+            expect(allText).not.toContain(HELPER_TOOLS.STORE_SEARCH);
+            expect(allText).not.toContain(HELPER_TOOLS.ACTOR_GET_DETAILS);
+        });
+
+        it('names only the loaded recovery tool when the session has a partial tool set', () => {
+            const response = buildCallActorErrorResponse({
+                actorName: 'apify/rag-web-browser',
+                error: new Error('boom'),
+                loadedToolNames: [HELPER_TOOLS.STORE_SEARCH],
+            });
+
+            const allText = (response.content ?? []).map(textOf).join('\n');
+            expect(allText).toContain(`search for available Actors using ${HELPER_TOOLS.STORE_SEARCH}`);
+            expect(allText).not.toContain(HELPER_TOOLS.ACTOR_GET_DETAILS);
         });
 
         it('returns memory-quota recovery hint for HTTP 402 memory-limit errors', () => {
@@ -146,17 +188,27 @@ describe('call_actor_common', () => {
                 actorName: 'compass/crawler-google-places',
                 error,
                 actorId: 'actor-789',
-                actorGetDetailsTool: HELPER_TOOLS.ACTOR_GET_DETAILS,
+                loadedToolNames: [HELPER_TOOLS.STORE_SEARCH, HELPER_TOOLS.ACTOR_GET_DETAILS],
             });
 
             expect(response.isError).toBe(true);
-            const allText = response.content.map((c) => c.text).join('\n');
+            const allText = (response.content ?? []).map(textOf).join('\n');
             expect(allText).toContain('memory limit of 8192MB');
             expect(allText).toContain('Account memory quota exceeded');
             expect(allText).toContain('callOptions.memory');
             // Regression: must not nudge the LLM toward aborting unrelated runs to free capacity.
             expect(allText).not.toContain(HELPER_TOOLS.ACTOR_RUNS_ABORT);
             expect(allText).not.toContain('verify the Actor name');
+            // 402 memory-limit derives SOFT_FAIL (4xx) with the memory-limit failureDetail.
+            expect(response.toolTelemetry).toEqual(
+                expect.objectContaining({
+                    toolStatus: TOOL_STATUS.SOFT_FAIL,
+                    failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
+                    failureHttpStatus: 402,
+                    failureDetail: APIFY_ERROR_TYPE_MEMORY_LIMIT_EXCEEDED,
+                    actorId: 'actor-789',
+                }),
+            );
         });
 
         it('returns the concurrent-run-limit billing hint for cannot-start-actor-runs errors', () => {
@@ -178,18 +230,83 @@ describe('call_actor_common', () => {
                 actorName: 'apify/instagram-scraper',
                 error,
                 actorId: 'actor-999',
-                actorGetDetailsTool: HELPER_TOOLS.ACTOR_GET_DETAILS,
+                loadedToolNames: [HELPER_TOOLS.STORE_SEARCH, HELPER_TOOLS.ACTOR_GET_DETAILS],
             });
 
             expect(response.isError).toBe(true);
-            const allText = response.content.map((c) => c.text).join('\n');
+            const allText = (response.content ?? []).map(textOf).join('\n');
             expect(allText).toContain('account limit for concurrent Actor runs');
             expect(allText).toContain('console.apify.com/billing/subscription');
             // Run-limit must not fall through to the generic "verify the Actor name" hint.
             expect(allText).not.toContain('verify the Actor name');
+            // Run-limit derives SOFT_FAIL even though it arrives as 402/5xx (billing condition).
             expect(response.toolTelemetry).toEqual(
-                expect.objectContaining({ failureDetail: 'cannot-start-actor-runs', actorId: 'actor-999' }),
+                expect.objectContaining({
+                    toolStatus: TOOL_STATUS.SOFT_FAIL,
+                    failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
+                    failureDetail: 'cannot-start-actor-runs',
+                    actorId: 'actor-999',
+                }),
             );
+        });
+
+        it('echoes the input schema and platform message for a start() invalid-input error, not the generic fallback', () => {
+            const error = new ApifyApiError(
+                {
+                    data: {
+                        error: {
+                            type: 'invalid-input',
+                            message: 'Input is not valid: query: must be a non-empty string',
+                        },
+                    },
+                    status: 400,
+                } as AxiosResponse,
+                1,
+            );
+            const inputSchema = { type: 'object', properties: { query: { type: 'string' } } } as const;
+
+            const response = buildCallActorErrorResponse({
+                actorName: 'apify/instagram-scraper',
+                error,
+                actorId: 'actor-321',
+                loadedToolNames: [HELPER_TOOLS.STORE_SEARCH, HELPER_TOOLS.ACTOR_GET_DETAILS],
+                inputSchema,
+            });
+
+            expect(response.isError).toBe(true);
+            const allText = (response.content ?? []).map(textOf).join('\n');
+            expect(allText).toContain(JSON.stringify(inputSchema));
+            expect(allText).toContain('query: must be a non-empty string');
+            expect(allText).toContain('Please ensure the input is correct');
+            // Must not point the agent at the wrong problem (Actor name / existence).
+            expect(allText).not.toContain('verify the Actor name');
+            expect(response.toolTelemetry).toEqual(
+                expect.objectContaining({
+                    toolStatus: TOOL_STATUS.SOFT_FAIL,
+                    failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
+                    actorId: 'actor-321',
+                }),
+            );
+        });
+
+        it('still returns the platform message (without a schema) when no inputSchema was resolved', () => {
+            const error = new ApifyApiError(
+                {
+                    data: { error: { type: 'invalid-input', message: 'Input is not valid: bad JSON' } },
+                    status: 400,
+                } as AxiosResponse,
+                1,
+            );
+
+            const response = buildCallActorErrorResponse({
+                actorName: 'apify/instagram-scraper',
+                error,
+                loadedToolNames: [HELPER_TOOLS.STORE_SEARCH, HELPER_TOOLS.ACTOR_GET_DETAILS],
+            });
+
+            const allText = (response.content ?? []).map(textOf).join('\n');
+            expect(allText).toContain('Input is not valid: bad JSON');
+            expect(allText).not.toContain('verify the Actor name');
         });
     });
 
@@ -220,39 +337,207 @@ describe('call_actor_common', () => {
         });
     });
 
-    describe('buildPermissionApprovalResponse', () => {
-        const makeError = (approvalUrl?: string) =>
-            new ApifyApiError(
-                {
-                    data: {
-                        error: {
-                            type: 'full-permission-actor-not-approved',
-                            message:
-                                'This Actor requires full access to your account. You must approve its permissions before running it.',
-                            ...(approvalUrl ? { data: { approvalUrl } } : {}),
-                        },
-                    },
-                    status: 403,
-                } as AxiosResponse,
-                1,
-            );
+    describe('resolveAndValidateActor', () => {
+        const INPUT_SCHEMA = { type: 'object', properties: { query: { type: 'string' } } };
+        const stubToolArgs = {
+            apifyClient: {},
+            mcpSessionId: 'session-1',
+            loadedToolNames: [],
+        } as unknown as InternalToolArgs;
 
-        it('includes the approval URL when present', () => {
-            const approvalUrl = 'https://console.apify.com/actors/abc123?approvePermissions=true';
-            const response = buildPermissionApprovalResponse(makeError(approvalUrl));
-
-            expect(response.isError).toBe(true);
-            const allText = response.content.map((c) => c.text).join('\n');
-            expect(allText).toContain('This Actor requires full access to your account');
-            expect(allText).toContain(approvalUrl);
+        beforeEach(() => {
+            vi.mocked(getActorsAsTools).mockReset();
         });
 
-        it('omits the URL line when approvalUrl is missing from error.data', () => {
-            const response = buildPermissionApprovalResponse(makeError());
+        function mockActorTool(ajvValidate: ((input: unknown) => boolean) & { errors?: unknown }): void {
+            const tool = {
+                type: TOOL_TYPE.ACTOR,
+                name: 'apify--rag-web-browser',
+                actorId: 'actor-id-rag',
+                actorFullName: 'apify/rag-web-browser',
+                inputSchema: INPUT_SCHEMA,
+                ajvValidate,
+            } as unknown as ToolEntry;
+            vi.mocked(getActorsAsTools).mockResolvedValue({ tools: [tool], errors: [] });
+        }
 
-            expect(response.isError).toBe(true);
-            expect(response.content).toHaveLength(1);
-            expect(response.content[0]?.text).toContain('This Actor requires full access to your account');
+        it('returns a SOFT_FAIL/404 not-found error when the Actor is missing', async () => {
+            vi.mocked(getActorsAsTools).mockResolvedValue({ tools: [], errors: [] });
+
+            const resolution = await resolveAndValidateActor({
+                actorName: 'apify/missing',
+                input: { query: 'x' },
+                toolArgs: stubToolArgs,
+            });
+
+            expect('error' in resolution).toBe(true);
+            const { error } = resolution as { error: TextToolResult & { toolTelemetry?: unknown } };
+            expect(error.isError).toBe(true);
+            expect(error.content[0].text).toContain("Actor 'apify/missing' was not found");
+            expect(error.toolTelemetry).toEqual({
+                toolStatus: TOOL_STATUS.SOFT_FAIL,
+                failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
+                failureHttpStatus: 404,
+                failureDetail: "Actor 'apify/missing' was not found",
+            });
+        });
+
+        // Result text has no `hasTool`, so tools.mode_contract.test.ts cannot see it: it renders
+        // descriptions only. `?tools=call-actor` is served no search-actors.
+        it('names no recovery tool in the not-found message when the session was served none', async () => {
+            vi.mocked(getActorsAsTools).mockResolvedValue({ tools: [], errors: [] });
+
+            const resolution = await resolveAndValidateActor({
+                actorName: 'apify/missing',
+                input: { query: 'x' },
+                toolArgs: stubToolArgs,
+            });
+
+            const { error } = resolution as { error: TextToolResult };
+            const allText = (error.content ?? []).map(textOf).join('\n');
+            expect(allText).toContain("Actor 'apify/missing' was not found");
+            expect(allText).not.toContain(HELPER_TOOLS.STORE_SEARCH);
+            expect(allText).not.toContain(HELPER_TOOLS.ACTOR_GET_DETAILS);
+        });
+
+        it('points at the search tool in the not-found message when the session was served it', async () => {
+            vi.mocked(getActorsAsTools).mockResolvedValue({ tools: [], errors: [] });
+
+            const resolution = await resolveAndValidateActor({
+                actorName: 'apify/missing',
+                input: { query: 'x' },
+                toolArgs: {
+                    ...stubToolArgs,
+                    loadedToolNames: [HELPER_TOOLS.STORE_SEARCH, HELPER_TOOLS.ACTOR_GET_DETAILS],
+                },
+            });
+
+            const { error } = resolution as { error: TextToolResult };
+            const allText = (error.content ?? []).map(textOf).join('\n');
+            expect(allText).toContain(`search for available Actors using the tool: ${HELPER_TOOLS.STORE_SEARCH}`);
+            // Served here, and still not offered: a detail lookup on an Actor that does not exist
+            // fails the same way. Passing both names is what makes this assertion bite.
+            expect(allText).not.toContain(HELPER_TOOLS.ACTOR_GET_DETAILS);
+        });
+
+        // Byte-identity guard for #937: the input-required error embeds the input schema in a
+        // ```json fence built via wrapJsonText — the exact bytes of the former hand-rolled fence.
+        it('embeds the input schema in an unchanged ```json fence for the input-required error', async () => {
+            mockActorTool((() => true) as never);
+
+            const resolution = await resolveAndValidateActor({
+                actorName: 'apify/rag-web-browser',
+                input: null as unknown as Record<string, unknown>,
+                toolArgs: stubToolArgs,
+            });
+
+            const { error } = resolution as { error: TextToolResult & { toolTelemetry?: Record<string, unknown> } };
+            expect(error.content[2].text).toBe(`\`\`\`json\n${JSON.stringify(INPUT_SCHEMA)}\n\`\`\``);
+            expect(error.toolTelemetry).toEqual({
+                toolStatus: TOOL_STATUS.SOFT_FAIL,
+                failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
+                failureDetail: 'input is required',
+                actorId: 'actor-id-rag',
+            });
+        });
+
+        // Byte-identity guard for #937: the validation-failed error keeps the `Input schema:\n`
+        // prefix before the wrapJsonText fence.
+        it('embeds the input schema in an unchanged ```json fence for the validation-failed error', async () => {
+            const ajvValidate = Object.assign(() => false, {
+                errors: [{ message: 'must have required property query' }],
+            });
+            mockActorTool(ajvValidate as never);
+
+            const resolution = await resolveAndValidateActor({
+                actorName: 'apify/rag-web-browser',
+                input: { wrong: 1 },
+                toolArgs: stubToolArgs,
+            });
+
+            const { error } = resolution as { error: TextToolResult & { toolTelemetry?: Record<string, unknown> } };
+            expect(error.content[1].text).toBe(`Input schema:\n\`\`\`json\n${JSON.stringify(INPUT_SCHEMA)}\n\`\`\``);
+            expect(error.toolTelemetry).toMatchObject({
+                toolStatus: TOOL_STATUS.SOFT_FAIL,
+                failureCategory: FAILURE_CATEGORY.INVALID_INPUT,
+                actorId: 'actor-id-rag',
+            });
+        });
+    });
+
+    describe('handleMcpToolCall()', () => {
+        beforeEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        it('forwards signal and timeout into client.callTool options', async () => {
+            const callTool = vi.fn().mockResolvedValue({
+                content: [{ type: 'text', text: 'remote ok' }],
+                isError: false,
+            });
+            vi.spyOn(mcpClient, 'connectMCPClient').mockResolvedValue({
+                callTool,
+                close: vi.fn().mockResolvedValue(undefined),
+            } as unknown as Client);
+
+            const controller = new AbortController();
+            const result = await handleMcpToolCall({
+                baseActorName: 'apify/mcp-demo',
+                mcpToolName: 'search',
+                input: { q: 'x' },
+                isActorMcpServer: true,
+                mcpServerUrl: 'https://example.invalid/mcp',
+                apifyToken: 'token',
+                signal: controller.signal,
+            });
+
+            expect(result?.isError).not.toBe(true);
+            expect(callTool).toHaveBeenCalledTimes(1);
+            const options = callTool.mock.calls[0][2] as { signal?: AbortSignal; timeout?: number };
+            expect(options.signal).toBe(controller.signal);
+            expect(options.timeout).toBe(EXTERNAL_TOOL_CALL_TIMEOUT_MSEC);
+        });
+
+        it('returns aborted when the signal is already aborted before the remote call', async () => {
+            const connectSpy = vi.spyOn(mcpClient, 'connectMCPClient').mockResolvedValue(null);
+            const controller = new AbortController();
+            controller.abort();
+
+            const result = await handleMcpToolCall({
+                baseActorName: 'apify/mcp-demo',
+                mcpToolName: 'search',
+                input: { q: 'x' },
+                isActorMcpServer: true,
+                mcpServerUrl: 'https://example.invalid/mcp',
+                apifyToken: 'token',
+                signal: controller.signal,
+            });
+
+            expect(result).toEqual({});
+            expect(connectSpy).not.toHaveBeenCalled();
+        });
+
+        it('returns aborted when the remote call rejects after the signal aborts', async () => {
+            const controller = new AbortController();
+            vi.spyOn(mcpClient, 'connectMCPClient').mockResolvedValue({
+                callTool: vi.fn().mockImplementation(async () => {
+                    controller.abort();
+                    throw new Error('aborted');
+                }),
+                close: vi.fn().mockResolvedValue(undefined),
+            } as unknown as Client);
+
+            const result = await handleMcpToolCall({
+                baseActorName: 'apify/mcp-demo',
+                mcpToolName: 'search',
+                input: { q: 'x' },
+                isActorMcpServer: true,
+                mcpServerUrl: 'https://example.invalid/mcp',
+                apifyToken: 'token',
+                signal: controller.signal,
+            });
+
+            expect(result).toEqual({});
         });
     });
 });

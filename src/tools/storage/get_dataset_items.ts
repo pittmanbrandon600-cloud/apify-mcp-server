@@ -1,15 +1,15 @@
 import dedent from 'dedent';
 import { z } from 'zod';
 
-import { HELPER_TOOLS, HTTP_NOT_FOUND } from '../../const.js';
+import { HELPER_TOOLS } from '../../const.js';
 import type { InternalToolArgs, ToolEntry, ToolInputSchema } from '../../types.js';
 import { TOOL_TYPE } from '../../types.js';
 import { compileSchema } from '../../utils/ajv.js';
 import { buildConsoleDatasetUrl, getConsoleLinkContext } from '../../utils/console_link.js';
 import { parseCommaSeparatedList, stripQuoteWrappers } from '../../utils/generic.js';
-import { getHttpStatusCode } from '../../utils/logging.js';
+import { respondUserError } from '../../utils/mcp.js';
 import { datasetItemsOutputSchema } from '../structured_output_schemas.js';
-import { buildDatasetItemsSummaryNextStep, buildStorageNotFound, buildStorageResponse } from './storage_helpers.js';
+import { buildDatasetItemsSummaryNextStep, buildStorageResponse, catchNotFound } from './storage_helpers.js';
 
 export const DEFAULT_DATASET_ITEMS_LIMIT = 20;
 
@@ -39,7 +39,7 @@ const getDatasetItemsArgs = z.object({
         .int()
         .min(1)
         .optional()
-        .describe(`Maximum number of items to return. Defaults to ${DEFAULT_DATASET_ITEMS_LIMIT}.`),
+        .describe(`Maximum number of items to return. Default is ${DEFAULT_DATASET_ITEMS_LIMIT}.`),
     fields: z
         .string()
         .optional()
@@ -67,18 +67,16 @@ export const getDatasetItems: ToolEntry = Object.freeze({
     name: HELPER_TOOLS.DATASET_GET_ITEMS,
     title: 'Get dataset items',
     description: dedent`
-        Retrieve dataset items with pagination, sorting, and field selection.
-        Items can be large; when you only need specific columns, pass fields to reduce response size (use ${HELPER_TOOLS.DATASET_GET} first if you don't know the field names).
-        For nested fields use dot notation (e.g., fields="metadata.url") — the server auto-flattens parent prefixes.
-        Defaults limit to ${DEFAULT_DATASET_ITEMS_LIMIT}. Use clean=true to skip empty items and hidden fields.
-
-        The results will include items along with pagination info (limit, offset) and total count.
+        Get items (rows) from a dataset — the output/results produced by an Actor run.
+        Returns the rows themselves, not dataset metadata, counts, or a schema.
+        When the user provides a datasetId and asks to retrieve results, output, data, or rows, call this tool directly.
+        Default limit is ${DEFAULT_DATASET_ITEMS_LIMIT}. Use clean=true to skip empty items and hidden fields.
 
         USAGE:
         - Use when you need to read data from a dataset (all items or only selected fields).
 
         USAGE EXAMPLES:
-        - user_input: Get first 20 items from dataset abd123
+        - user_input: Retrieve results from dataset abc123
         - user_input: Get only metadata.url and title from dataset username~my-dataset`,
     inputSchema: z.toJSONSchema(getDatasetItemsArgs) as ToolInputSchema,
     outputSchema: datasetItemsOutputSchema,
@@ -92,7 +90,7 @@ export const getDatasetItems: ToolEntry = Object.freeze({
         openWorldHint: false,
     },
     call: async (toolArgs: InternalToolArgs) => {
-        const { args, apifyClient: client, apifyToken, apifyMcpServer } = toolArgs;
+        const { args, apifyClient: client, apifyToken, loadedToolNames } = toolArgs;
         const parsed = getDatasetItemsArgs.parse(args);
 
         const fields = parseCommaSeparatedList(parsed.fields);
@@ -102,12 +100,8 @@ export const getDatasetItems: ToolEntry = Object.freeze({
 
         const effectiveLimit = parsed.limit ?? DEFAULT_DATASET_ITEMS_LIMIT;
         const datasetId = stripQuoteWrappers(parsed.datasetId);
-        // `dataset(id).listItems()` throws ApifyApiError on a missing dataset
-        // instead of returning undefined (only `.get()` and `.getStatistics()`
-        // soft-catch 404 in the SDK), so translate 404 into a soft-fail.
-        const v = await client
-            .dataset(datasetId)
-            .listItems({
+        const v = await catchNotFound(
+            client.dataset(datasetId).listItems({
                 clean: parsed.clean,
                 offset: parsed.offset,
                 limit: effectiveLimit,
@@ -115,15 +109,10 @@ export const getDatasetItems: ToolEntry = Object.freeze({
                 omit,
                 desc: parsed.desc,
                 flatten,
-            })
-            .catch((err: unknown) => {
-                if (getHttpStatusCode(err) === HTTP_NOT_FOUND) {
-                    return null;
-                }
-                throw err;
-            });
+            }),
+        );
         if (!v) {
-            return buildStorageNotFound(`Dataset '${datasetId}' not found.`);
+            return respondUserError(`Dataset '${datasetId}' not found.`);
         }
 
         const offset = parsed.offset ?? 0;
@@ -143,8 +132,8 @@ export const getDatasetItems: ToolEntry = Object.freeze({
             itemCount: v.items.length,
             totalItemCount: v.total,
             offset,
-            loadedToolNames: apifyMcpServer.listToolNames(),
+            loadedToolNames,
         });
-        return buildStorageResponse({ structuredContent, summary, nextStep, toon: true, apifyConsoleUrl });
+        return buildStorageResponse({ structuredContent, summary, nextStep, apifyConsoleUrl });
     },
 } as const);

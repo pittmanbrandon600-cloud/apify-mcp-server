@@ -5,6 +5,9 @@
  * at runtime.
  */
 
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+
 import { RESOURCE_MIME_TYPE } from '@modelcontextprotocol/ext-apps';
 import type { Resource } from '@modelcontextprotocol/sdk/types.js';
 
@@ -92,8 +95,9 @@ function createWidgetMeta(params: { resourceUri: string; invoking: string; invok
     return {
         'openai/toolInvocation/invoking': invoking,
         'openai/toolInvocation/invoked': invoked,
-        // ChatGPT compatibility keys — required for public apps in ChatGPT.
-        // These were removed during MCP Apps migration but ChatGPT still reads them.
+        // ChatGPT compatibility keys. `widgetAccessible` and `widgetPrefersBorder` were
+        // dropped in the MCP Apps migration and are left here (commented) as a reference for
+        // what ChatGPT public apps read — re-add them if ChatGPT public-app support regresses.
         // 'openai/widgetAccessible': true,
         'openai/widgetCSP': OPENAI_WIDGET_CSP,
         // 'openai/widgetPrefersBorder': WIDGET_BASE_UI.prefersBorder,
@@ -153,15 +157,12 @@ export type AvailableWidget = WidgetConfig & {
  * @returns Map of widget URIs to their resolved state
  */
 export async function resolveAvailableWidgets(baseDir: string): Promise<Map<string, AvailableWidget>> {
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-
     const resolvedWidgets = new Map<string, AvailableWidget>();
-    const webDistPath = path.resolve(baseDir, '../web/dist');
+    const webDistPath = resolve(baseDir, '../web/dist');
 
     for (const [uri, config] of Object.entries(WIDGET_REGISTRY)) {
-        const jsPath = path.resolve(webDistPath, config.jsFilename);
-        const exists = fs.existsSync(jsPath);
+        const jsPath = resolve(webDistPath, config.jsFilename);
+        const exists = existsSync(jsPath);
 
         resolvedWidgets.set(uri, {
             ...config,
@@ -181,4 +182,15 @@ export async function resolveAvailableWidgets(baseDir: string): Promise<Map<stri
  */
 export function getWidgetConfig(uri: string): WidgetConfig | undefined {
     return WIDGET_REGISTRY[uri];
+}
+
+/**
+ * Actor-run widget `_meta`, with a per-run `openai/widgetDescription` merged in.
+ * Shared by `buildStartRunWidgetResponse` and `buildGetActorRunWidgetResponse`.
+ */
+export function buildActorRunWidgetMeta(descriptionName: string): NonNullable<Resource['_meta']> {
+    return {
+        ...(getWidgetConfig(WIDGET_URIS.ACTOR_RUN)?.meta ?? {}),
+        'openai/widgetDescription': `Actor run progress for ${descriptionName}`,
+    };
 }

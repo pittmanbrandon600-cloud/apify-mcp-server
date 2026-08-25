@@ -1,6 +1,7 @@
 import type { Build } from 'apify-client';
 
 import type { ApifyClient } from '../apify_client.js';
+import { CODE_RUNTIME_ACTOR_NAME } from '../const.js';
 import { connectMCPClient } from '../mcp/client.js';
 import type { PaymentProvider } from '../payments/types.js';
 import { filterSchemaProperties, shortenProperties } from '../tools/actor_input_schema.js';
@@ -8,7 +9,7 @@ import type { Actor, ActorCardOptions, ActorInputSchema, ActorStoreList, Structu
 import { getActorMcpUrlCached } from './actor.js';
 import { formatActorForWidget, formatActorToActorCard, formatActorToStructuredCard } from './actor_card.js';
 import { searchActorsByKeywords } from './actor_search.js';
-import { logHttpError } from './logging.js';
+import { getHttpStatusCode, logHttpError } from './logging.js';
 import type { PricingTier } from './pricing_info.js';
 
 const ACTOR_DETAILS_PICTURE_SEARCH_LIMIT = 5;
@@ -40,11 +41,23 @@ function typeValueToString(value: unknown): string {
 /**
  * Resolve README content with fallback: prefer readmeSummary, fall back to full readme.
  * Returns the content string and appropriate heading for text output.
+ *
+ * apify/code-runtime is hardcoded to always get its full README (see CODE_RUNTIME_ACTOR_NAME) —
+ * its README documents an exact API contract (method names/shapes) that the auto-generated
+ * summary can omit, and there's no per-call way to request the raw text otherwise.
  */
-export function resolveReadmeContent(details: { readmeSummary?: string; readme: string }): {
+export function resolveReadmeContent(details: {
+    actorInfo: { username: string; name: string };
+    readmeSummary?: string;
+    readme: string;
+}): {
     content: string;
     heading: string;
 } {
+    const actorName = `${details.actorInfo.username}/${details.actorInfo.name}`;
+    if (actorName === CODE_RUNTIME_ACTOR_NAME) {
+        return { content: details.readme, heading: '# README' };
+    }
     if (details.readmeSummary?.trim()) {
         return { content: details.readmeSummary, heading: '# README summary' };
     }
@@ -78,7 +91,7 @@ export async function fetchActorDetails(
                 actor.defaultBuild().then(async (build) => build.get()),
                 searchActorsByKeywords({
                     search: actorSlug,
-                    apifyToken: apifyClient.token || '',
+                    apifyClient,
                     limit: ACTOR_DETAILS_PICTURE_SEARCH_LIMIT,
                 }).catch(() => []),
             ]);
@@ -108,8 +121,15 @@ export async function fetchActorDetails(
             readmeSummary: actorInfo.readmeSummary,
         };
     } catch (error) {
-        logHttpError(error, `Failed to fetch actor details for '${actorName}'`, { actorName });
-        return null;
+        // 404/400 is a genuine "Actor doesn't exist" — same treatment as the not-found check
+        // above. Anything else (401/403/5xx) must propagate: it's a different failure class
+        // (e.g. invalid token) the caller should surface as such, not as "not found".
+        const statusCode = getHttpStatusCode(error);
+        if (statusCode === 404 || statusCode === 400) {
+            logHttpError(error, `Failed to fetch actor details for '${actorName}'`, { actorName });
+            return null;
+        }
+        throw error;
     }
 }
 

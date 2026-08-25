@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { APIFY_STORE_URL, HELPER_TOOLS, MAX_INPUT_FIELDS_IN_ACTOR_CARD } from '../../src/const.js';
 import { searchActors } from '../../src/tools/actors/search_actors.js';
 import { actorInfoSchema } from '../../src/tools/structured_output_schemas.js';
-import type { ActorStoreInputSchema, ActorStoreList, HelperTool } from '../../src/types.js';
+import type { ActorStoreInputSchema, ActorStoreList, HelperTool, InternalToolArgs } from '../../src/types.js';
 import {
     DEFAULT_CARD_OPTIONS,
     formatActorToActorCard,
@@ -50,11 +50,7 @@ describe('search-actors without widget (searchActors)', () => {
         vi.mocked(searchAgentSafeActors).mockResolvedValue([MOCK_STORE_ACTOR]);
 
         const result = await (searchActors as HelperTool).call(
-            stubInternalToolArgs({
-                keywords: SEARCH_KEYWORDS,
-                limit: 5,
-                offset: 0,
-            }),
+            stubInternalToolArgs({ keywords: SEARCH_KEYWORDS, limit: 5, offset: 0 }, [HELPER_TOOLS.ACTOR_GET_DETAILS]),
         );
 
         const { structuredContent, content } = result as {
@@ -195,6 +191,18 @@ describe('search-actors without widget (searchActors)', () => {
         expect(undeclared).toEqual([]);
     });
 
+    it('searches using the request-scoped apifyClient, not a token-only client', async () => {
+        vi.mocked(searchAgentSafeActors).mockResolvedValue([MOCK_STORE_ACTOR]);
+        const taggedApifyClient = { marker: 'tagged-client' } as unknown as InternalToolArgs['apifyClient'];
+
+        await (searchActors as HelperTool).call({
+            ...stubInternalToolArgs({ keywords: SEARCH_KEYWORDS, limit: 5, offset: 0 }),
+            apifyClient: taggedApifyClient,
+        });
+
+        expect(searchAgentSafeActors).toHaveBeenCalledWith(expect.objectContaining({ apifyClient: taggedApifyClient }));
+    });
+
     // Org-prefixed and non-Console variants are covered by console_link.test.ts and
     // the get-actor-run response tests.
     it('mints Console links for a Console UI token', async () => {
@@ -214,5 +222,24 @@ describe('search-actors without widget (searchActors)', () => {
         expect(structuredContent.actors[0].url).toBe(consoleUrl);
         expect(content[0].text).toContain(`## [${MOCK_STORE_ACTOR.title}](${consoleUrl})`);
         expect(content[0].text).not.toContain(`${APIFY_STORE_URL}/apify/web-scraper`);
+    });
+
+    // The footer is result text, which `tools.mode_contract.test.ts` cannot see — it renders
+    // descriptions only. A `?tools=search-actors` session is served no fetch-actor-details.
+    it('names no follow-up tool in the footer when the session was not served one', async () => {
+        vi.mocked(searchAgentSafeActors).mockResolvedValue([MOCK_STORE_ACTOR]);
+
+        const result = await (searchActors as HelperTool).call(
+            stubInternalToolArgs({ keywords: SEARCH_KEYWORDS, limit: 5, offset: 0 }),
+        );
+        const { structuredContent, content } = result as {
+            structuredContent: { instructions?: string };
+            content: { type: string; text: string }[];
+        };
+
+        expect(structuredContent.instructions).not.toContain(HELPER_TOOLS.ACTOR_GET_DETAILS);
+        expect(structuredContent.instructions).toContain('second search with broader');
+        expect(content[0].text).not.toContain(HELPER_TOOLS.ACTOR_GET_DETAILS);
+        expect(content[0].text).toContain('second search with broader');
     });
 });

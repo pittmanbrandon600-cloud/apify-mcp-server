@@ -9,13 +9,7 @@ import { fileURLToPath } from 'node:url';
 import log from '@apify/log';
 
 // Re-export shared config
-export {
-    OPENROUTER_CONFIG,
-    sanitizeEnvValue,
-    sanitizeProcessEnv,
-    validateEnvVars,
-    getRequiredEnvVars,
-} from './shared/config.js';
+export { OPENROUTER_CONFIG, sanitizeEnvValue, sanitizeProcessEnv } from './shared/config.js';
 
 // Read the version from test-cases.json
 function getTestCasesVersion(): string {
@@ -41,7 +35,7 @@ export const MODELS_TO_EVALUATE = [
     // 'anthropic/claude-sonnet-4.5',
     'google/gemini-2.5-flash',
     // 'google/gemini-2.5-pro',
-    'openai/gpt-5.4',
+    'openai/gpt-5.4-mini',
     // 'openai/gpt-5-mini',
     // 'openai/gpt-4o-mini', // deprecated model
 ];
@@ -95,6 +89,7 @@ You must judge whether this agent made the correct selection.
 
 **search-actors**: Searches the Apify Store to find scraping tools/Actors (NOT celebrity actors). This finds pre-built scraping solutions.
 - Use when query mentions: "Actor", "tool", "scraper", or asks about finding/discovering scraping capabilities
+- Do NOT use for immediate data retrieval (today/latest/recent/current/now, or get/fetch data right now) — use apify--rag-web-browser
 - Example: "Find an Actor for Instagram" or "What tools scrape Twitter?"
 
 **apify--rag-web-browser**: Browses the web to get data immediately (one-time data retrieval).
@@ -111,39 +106,39 @@ You must judge whether this agent made the correct selection.
 
 **search-apify-docs**: Searches Apify documentation for general info about Apify platform/features.
 - Use when query asks about Apify concepts, features, or how to use the platform
-- Searches across all documentation to find relevant pages
+- Do not also call search-actors unless the user asks to find scraping tools or Actors
 - Example: "How to create an Apify Actor?" or "What is Apify Proxy?"
 
-**get-dataset-items**: Retrieves the output data (results) from a completed Actor run using its datasetId.
-- Use when query asks to get/fetch/retrieve data from a previous Actor execution
-- Returns the actual scraped data, not Actor documentation
-- Example: "Get the data from my last Actor run" or "Show me the results from dataset abc123"
+**get-dataset-items**: Gets items (rows) from a dataset — the output/results produced by an Actor run. NOT metadata or schema.
+- Use when query asks to get/fetch/retrieve results, output, or row data and provides a datasetId — call directly, do not prefetch with get-dataset or get-dataset-schema
+- Example: "Retrieve results from dataset abc123" or "Get the output from my last Actor run"
 
-**get-dataset**: Gets metadata about a dataset (itemCount, fields, stats) — NOT the items themselves.
+**get-dataset**: Gets dataset metadata (itemCount, fields, stats) — NOT the row data. Call alone; do not also call get-dataset-schema.
 - Use when query asks about a dataset's details, size, item count, or fields
-- Example: "How many items are in dataset abc123?" or "Show info for dataset des32s"
+- Do not use when the user asks to retrieve/show results, data, or rows — use get-dataset-items
+- Example: "How many items are in dataset abc123?" or "Show metadata and stats for dataset des32s"
 
-**get-dataset-schema**: Generates a JSON schema inferred from a sample of dataset items.
-- Use when query asks for the schema, structure, or shape of a dataset
+**get-dataset-schema**: Generates a JSON schema inferred from a sample of dataset items — field names and types. NOT metadata, stats, or row data.
+- Use when query explicitly asks for a JSON schema or to infer structure/shape from a sample
 - Example: "What is the schema of dataset abc123?" or "Generate a schema for dataset des32s"
 
-**get-dataset-list**: Lists the datasets owned by the authenticated user.
+**get-dataset-list**: Lists the datasets owned by the authenticated user — summaries only, not contents (use get-dataset to inspect one).
 - Use when query asks to list/browse the user's datasets (not a specific dataset's contents)
 - Example: "List all my datasets" or "What datasets do I have?"
 
-**get-key-value-store-record**: Gets the value stored under a specific key in a key-value store.
+**get-key-value-store-record**: Gets the value stored under a specific key in a key-value store (use get-key-value-store-keys first if the key name is unknown).
 - Use when query asks to read/get a record or value by key from a key-value store
 - Example: "Get record INPUT from store abc123" or "Read the value under key OUTPUT in store des32s"
 
-**get-key-value-store-keys**: Lists the keys in a key-value store.
+**get-key-value-store-keys**: Lists the keys in a key-value store — key names and basic info, not the values (use get-key-value-store-record to read one).
 - Use when query asks which keys/records exist in a key-value store
 - Example: "List the keys in key-value store abc123"
 
-**get-key-value-store**: Gets metadata about a key-value store (details, owner, usage stats) — NOT a record value.
+**get-key-value-store**: Gets metadata about a key-value store (details, owner, usage stats) — NOT a record value. Use get-key-value-store-keys to list what it holds.
 - Use when query asks about a key-value store's details or properties
 - Example: "Show info for key-value store abc123"
 
-**get-key-value-store-list**: Lists the key-value stores owned by the authenticated user.
+**get-key-value-store-list**: Lists the key-value stores owned by the authenticated user — summaries only, not contents (use get-key-value-store to inspect one).
 - Use when query asks to list/browse the user's key-value stores (not a specific store's contents)
 - Example: "List all my key-value stores"
 
@@ -151,6 +146,31 @@ You must judge whether this agent made the correct selection.
 - Use when user provides a specific docs URL they want to read
 - Different from search-apify-docs which searches across all documentation
 - Example: "Fetch https://docs.apify.com/platform/actors/running" or "Show me the content of this docs page"
+
+**get-actor-task**: Reads a saved Actor task — its input, run options, publication state and public display configuration. Read-only.
+- Use when query asks what a task contains, how it is configured, or whether it is published
+- Example: "What is the configuration of my task insta-daily?" or "Is my task published?"
+
+**create-actor-task**: Saves an Actor configuration as a new named task.
+- Use when query asks to save/create a task for an Actor
+- Do not use when the task already exists — that is update-actor-task
+- Example: "Save my apify/instagram-scraper settings as a task called insta-daily"
+
+**update-actor-task**: Changes an existing task's input, run options, or the public display configuration (publicConfig) of its landing page. It does NOT publish the task.
+- Use when query asks to change an existing task, or to set up/prepare a task for publishing
+- A task must have publicConfig.inputSchemaFields and publicConfig.datasetView set here before it can be published
+- "Set up for publishing" or "configure the landing page" means update-actor-task, NOT publish-actor-task
+- Example: "Change my task to use the beta build" or "Set up insta-daily for publishing with the overview dataset view"
+
+**publish-actor-task**: Publishes an already-configured task on its public landing page.
+- Use when query asks to publish a task or make it public
+- Does not fill in any configuration — if the task is not ready, update-actor-task must run first
+- Example: "Publish my task insta-daily" or "Make my task public"
+
+**unpublish-actor-task**: Takes a task's public landing page down. The display configuration is preserved.
+- Use when query asks to unpublish a task or make it private again
+- Preserving the settings is automatic, so no update-actor-task call is needed alongside it
+- Example: "Unpublish insta-daily" or "Take my task off its public page but keep its settings"
 
 
 ## Keyword Length Guidelines

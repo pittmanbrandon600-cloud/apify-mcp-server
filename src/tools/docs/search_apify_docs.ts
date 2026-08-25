@@ -1,11 +1,11 @@
 import { z } from 'zod';
 
 import { DOCS_SOURCES, HELPER_TOOLS } from '../../const.js';
-import type { InternalToolArgs, ToolEntry, ToolInputSchema } from '../../types.js';
-import { TOOL_TYPE } from '../../types.js';
+import type { InternalToolArgs, ToolDescriptionContext, ToolEntry, ToolInputSchema } from '../../types.js';
+import { ALL_TOOLS_PRESENT, TOOL_TYPE } from '../../types.js';
 import { compileSchema } from '../../utils/ajv.js';
 import { searchDocsBySourceCached } from '../../utils/apify_docs.js';
-import { buildMCPResponse } from '../../utils/mcp.js';
+import { respondOk } from '../../utils/mcp.js';
 import { searchApifyDocsToolOutputSchema } from '../structured_output_schemas.js';
 
 const PLATFORM_DOCS_PREFERENCE = `When results contain both platform documentation (\`docs.apify.com/platform\`) \
@@ -22,12 +22,13 @@ function buildDocSourceDescription(): string {
 /**
  * Build tool description dynamically from DOCS_SOURCES
  */
-function buildToolDescription(): string {
+function buildDescription({ hasTool }: ToolDescriptionContext): string {
     const sources = DOCS_SOURCES.map((idx) => `• docSource="${idx.id}" - ${idx.label}:\n  ${idx.description}`).join(
         '\n\n',
     );
 
     return `Search Apify and Crawlee documentation using full-text search.
+Do not also search the Apify Store unless the user asks to find Actors.
 
 You must explicitly select which documentation source to search using the docSource parameter:
 
@@ -35,9 +36,7 @@ ${sources}
 
 The results will include the URL of the documentation page (which may include an anchor),
 and a limited piece of content that matches the search query.
-
-Fetch the full content of the document using the ${HELPER_TOOLS.DOCS_FETCH} tool by providing the URL.
-
+${hasTool(HELPER_TOOLS.DOCS_FETCH) ? `\nFetch the full content of the document using the ${HELPER_TOOLS.DOCS_FETCH} tool by providing the URL.\n` : ''}
 ${PLATFORM_DOCS_PREFERENCE}`;
 }
 
@@ -72,7 +71,8 @@ export const searchApifyDocs: ToolEntry = Object.freeze({
     type: TOOL_TYPE.INTERNAL,
     name: HELPER_TOOLS.DOCS_SEARCH,
     title: 'Search Apify docs',
-    description: buildToolDescription(),
+    description: buildDescription(ALL_TOOLS_PRESENT),
+    buildDescription,
     inputSchema: searchApifyDocsToolInputSchema,
     outputSchema: searchApifyDocsToolOutputSchema,
     ajvValidate: compileSchema(searchApifyDocsToolInputSchema),
@@ -103,12 +103,10 @@ You can also try using more specific or alternative keywords related to your sea
                 count: 0,
                 instructions,
             };
-            return buildMCPResponse({ texts: [instructions], structuredContent });
+            return respondOk(instructions, { structuredContent });
         }
 
-        // Instructions for LLM to use the docs fetch tool when retrieving full document content
         const instructions = `You can use the Apify docs fetch tool to retrieve the full content of a document by its URL. ${PLATFORM_DOCS_PREFERENCE}`;
-        // Actual unstructured text result
         const textResult = `Search results for "${query}" in ${parsed.docSource}:
 
 ${results
@@ -131,6 +129,6 @@ ${results
             instructions,
         };
         // We put the instructions at the end so that they are more likely to be acknowledged by the LLM
-        return buildMCPResponse({ texts: [textResult, instructions], structuredContent });
+        return respondOk([textResult, instructions], { structuredContent });
     },
 } as const);

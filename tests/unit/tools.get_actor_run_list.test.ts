@@ -3,15 +3,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { HELPER_TOOLS } from '../../src/const.js';
 import { getActorRunList } from '../../src/tools/runs/get_actor_run_list.js';
 import type { HelperTool, InternalToolArgs } from '../../src/types.js';
-import { decodeFencedToolText, stubToolCallContext, type TextToolResult } from './helpers/tool_context.js';
+import { stubToolCallContext, type TextToolResult } from './helpers/tool_context.js';
 
 const listMock = vi.fn();
 
-vi.mock('../../src/apify_client.js', () => ({
-    ApifyClient: vi.fn().mockImplementation(function () {
-        return { runs: () => ({ list: listMock }) };
-    }),
-}));
+const stubClient = { runs: () => ({ list: listMock }) } as unknown as InternalToolArgs['apifyClient'];
 
 const MOCK_RUNS = {
     total: 1,
@@ -32,21 +28,18 @@ const MOCK_RUNS = {
     ],
 };
 
-// get_actor_run_list constructs its own ApifyClient from the token, so the injected client is unused.
-const noClient = null as unknown as InternalToolArgs['apifyClient'];
-
 describe('get-actor-run-list', () => {
     it('has the expected tool name', () => {
         expect(getActorRunList.name).toBe(HELPER_TOOLS.ACTOR_RUN_LIST_GET);
     });
 
-    it('returns runs as fenced text (json or toon), mirrors them in structuredContent, and declares an outputSchema', async () => {
+    it('returns runs as JSON text, mirrors them in structuredContent, and declares an outputSchema', async () => {
         listMock.mockResolvedValue(MOCK_RUNS);
 
-        const result = await (getActorRunList as HelperTool).call(stubToolCallContext({}, noClient));
+        const result = await (getActorRunList as HelperTool).call(stubToolCallContext({}, stubClient));
         const { content } = result as TextToolResult;
 
-        expect(decodeFencedToolText(content[0].text)).toEqual(MOCK_RUNS);
+        expect(JSON.parse(content[0].text)).toEqual(MOCK_RUNS);
         expect((result as TextToolResult).structuredContent).toEqual(MOCK_RUNS);
         expect((getActorRunList as HelperTool).outputSchema).toMatchObject({ type: 'object' });
     });
@@ -55,7 +48,7 @@ describe('get-actor-run-list', () => {
         listMock.mockResolvedValue(MOCK_RUNS);
 
         await (getActorRunList as HelperTool).call(
-            stubToolCallContext({ limit: 5, offset: 2, desc: true, status: 'SUCCEEDED' }, noClient),
+            stubToolCallContext({ limit: 5, offset: 2, desc: true, status: 'SUCCEEDED' }, stubClient),
         );
 
         expect(listMock).toHaveBeenCalledWith({ limit: 5, offset: 2, desc: true, status: 'SUCCEEDED' });
@@ -64,7 +57,7 @@ describe('get-actor-run-list', () => {
     it('applies defaults (limit=10, offset=0, desc=false) when no params given', async () => {
         listMock.mockResolvedValue(MOCK_RUNS);
 
-        await (getActorRunList as HelperTool).call(stubToolCallContext({}, noClient));
+        await (getActorRunList as HelperTool).call(stubToolCallContext({}, stubClient));
 
         expect(listMock).toHaveBeenCalledWith({ limit: 10, offset: 0, desc: false, status: undefined });
     });

@@ -3,14 +3,18 @@ import { z } from 'zod';
 
 import { HELPER_TOOLS } from '../../const.js';
 import { getWidgetConfig, WIDGET_URIS } from '../../resources/widgets.js';
-import type { InternalToolArgs, ToolEntry, ToolInputSchema } from '../../types.js';
-import { TOOL_TYPE } from '../../types.js';
+import type { InternalToolArgs, ToolDescriptionContext, ToolEntry, ToolInputSchema } from '../../types.js';
+import { ALL_TOOLS_PRESENT, TOOL_TYPE } from '../../types.js';
 import { formatActorForWidget } from '../../utils/actor_card.js';
 import { searchAgentSafeActors } from '../../utils/actor_search.js';
 import { compileSchema } from '../../utils/ajv.js';
-import { buildMCPResponse } from '../../utils/mcp.js';
+import { respondOk } from '../../utils/mcp.js';
 import { getUserInfoCached } from '../../utils/userid_cache.js';
-import { buildSearchActorsResult, searchActorsBaseArgsSchema } from '../actors/search_actors.js';
+import {
+    buildNoActorsFoundInstructions,
+    buildSearchActorsResult,
+    searchActorsBaseArgsSchema,
+} from '../actors/search_actors.js';
 import { actorSearchWidgetOutputSchema } from '../structured_output_schemas.js';
 
 /**
@@ -21,25 +25,24 @@ import { actorSearchWidgetOutputSchema } from '../structured_output_schemas.js';
  */
 const searchActorsWidgetArgsSchema = searchActorsBaseArgsSchema.strict();
 
-const SEARCH_ACTORS_WIDGET_DESCRIPTION = dedent`
-    Render an interactive UI element (widget) displaying Apify Store search results for the user.
+function buildDescription({ hasTool }: ToolDescriptionContext): string {
+    return dedent`
+        Render an interactive UI element (widget) displaying Apify Store search results for the user.
 
-    Use this tool ONLY when the user explicitly wants to browse or discover Actors visually
-    (e.g., "find me scrapers for Instagram", "show me Amazon Actors", "what tools exist for Twitter").
-    The response renders as an interactive widget the user can view directly.
-
-    For silent name resolution before running an Actor (e.g., "scrape google maps" — you need to
-    find the right Actor first, then fetch its schema and call it), use ${HELPER_TOOLS.STORE_SEARCH}
-    instead — it returns the same data without rendering a widget.
-
-    Input: keywords (plus optional limit/offset). Output fields are fixed by the widget contract.
-`;
+        Use this tool ONLY when the user explicitly wants to browse or discover Actors visually
+        (e.g., "find me scrapers for Instagram", "show me Amazon Actors", "what tools exist for Twitter").
+        The response renders as an interactive widget the user can view directly.
+        ${hasTool(HELPER_TOOLS.STORE_SEARCH) ? `\nFor silent name resolution before running an Actor (e.g., "scrape google maps" — you need to find the right Actor first, then fetch its schema and call it), use ${HELPER_TOOLS.STORE_SEARCH} instead — it returns the same data without rendering a widget.\n` : ''}
+        Input: keywords (plus optional limit/offset). Output fields are fixed by the widget contract.
+    `;
+}
 
 export const searchActorsWidget: ToolEntry = Object.freeze({
     type: TOOL_TYPE.INTERNAL,
     name: HELPER_TOOLS.STORE_SEARCH_WIDGET,
     title: 'Search Actors (widget)',
-    description: SEARCH_ACTORS_WIDGET_DESCRIPTION,
+    description: buildDescription(ALL_TOOLS_PRESENT),
+    buildDescription,
     inputSchema: z.toJSONSchema(searchActorsWidgetArgsSchema) as ToolInputSchema,
     outputSchema: actorSearchWidgetOutputSchema,
     ajvValidate: compileSchema(z.toJSONSchema(searchActorsWidgetArgsSchema)),
@@ -55,17 +58,17 @@ export const searchActorsWidget: ToolEntry = Object.freeze({
         openWorldHint: false,
     },
     call: async (toolArgs: InternalToolArgs) => {
-        const { args, apifyToken, apifyClient, apifyMcpServer } = toolArgs;
+        const { args, apifyToken, apifyClient, paymentProvider } = toolArgs;
         const parsed = searchActorsWidgetArgsSchema.parse(args);
         // Actor search and user-info fetch are independent; run in parallel to avoid a
         // sequential round-trip on cache miss.
         const [actors, { userPlanTier }] = await Promise.all([
             searchAgentSafeActors({
                 keywords: parsed.keywords,
-                apifyToken,
+                apifyClient,
                 limit: parsed.limit,
                 offset: parsed.offset,
-                paymentProvider: apifyMcpServer.options.paymentProvider,
+                paymentProvider,
             }),
             getUserInfoCached(apifyToken, apifyClient),
         ]);
@@ -73,13 +76,8 @@ export const searchActorsWidget: ToolEntry = Object.freeze({
         if (actors.length === 0) {
             // Honor the widget tool's declared outputSchema: widgetActors is required, so
             // emit an empty array rather than dropping the field.
-            const instructions = dedent`
-                No Actors were found for the search query "${parsed.keywords}".
-                You MUST retry with broader, more generic keywords - use just the platform name
-                (e.g., "TikTok" instead of "TikTok posts") before concluding no Actor exists.
-            `;
-            return buildMCPResponse({
-                texts: [instructions],
+            const instructions = buildNoActorsFoundInstructions(parsed.keywords);
+            return respondOk(instructions, {
                 structuredContent: {
                     actors: [],
                     query: parsed.keywords,
@@ -111,11 +109,10 @@ export const searchActorsWidget: ToolEntry = Object.freeze({
         ];
 
         const widgetConfig = getWidgetConfig(WIDGET_URIS.SEARCH_ACTORS);
-        return buildMCPResponse({
-            texts,
+        return respondOk(texts, {
             structuredContent,
             // Response-level meta; only returned in apps mode (this handler is apps-only).
-            _meta: {
+            meta: {
                 ...widgetConfig?.meta,
                 'openai/widgetDescription': `Interactive actor search results showing ${actors.length} ${actors.length === 1 ? 'actor' : 'actors'} from Apify Store`,
             },

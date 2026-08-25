@@ -2,22 +2,23 @@ import type { AudioContent, EmbeddedResource, ImageContent, ResourceLink } from 
 import dedent from 'dedent';
 import { z } from 'zod';
 
-import { HELPER_TOOLS, KV_RECORD_MAX_INLINE_BYTES } from '../../const.js';
+import { HELPER_TOOLS } from '../../const.js';
 import type { InternalToolArgs, ToolEntry, ToolInputSchema } from '../../types.js';
 import { TOOL_TYPE } from '../../types.js';
 import { compileSchema } from '../../utils/ajv.js';
 import { buildConsoleKeyValueStoreUrl, getConsoleLinkContext } from '../../utils/console_link.js';
 import { computeValueBytes, stripQuoteWrappers } from '../../utils/generic.js';
+import { respondRaw, respondUserError } from '../../utils/mcp.js';
 import { keyValueStoreRecordOutputSchema } from '../structured_output_schemas.js';
 import {
+    buildBinaryRecordDisposition,
     buildConsoleLinkContent,
-    buildStorageNotFound,
     buildStorageResponse,
     normalizeRecordKey,
 } from './storage_helpers.js';
 
 const getKeyValueStoreRecordArgs = z.object({
-    keyValueStoreId: z.string().min(1).describe('Key-value store ID or username~store-name'),
+    keyValueStoreId: z.string().min(1).describe('Key-value store ID or username~store-name.'),
     recordKey: z.string().min(1).describe('Key of the record to retrieve.'),
 });
 
@@ -29,7 +30,8 @@ export const getKeyValueStoreRecord: ToolEntry = Object.freeze({
     name: HELPER_TOOLS.KEY_VALUE_STORE_RECORD_GET,
     title: 'Get key-value store record',
     description: dedent`
-        Get a value stored in a key-value store under a specific key.
+        Get the value stored under a specific key in a key-value store — a single record, not a listing of all keys.
+        Requires the exact key name.
         The response preserves the original Content-Encoding; most clients handle decompression automatically.
 
         USAGE:
@@ -62,7 +64,7 @@ export const getKeyValueStoreRecord: ToolEntry = Object.freeze({
             const text = storeInfo
                 ? `Record '${recordKey}' not found in key-value store '${keyValueStoreId}'.`
                 : `Key-value store '${keyValueStoreId}' not found.`;
-            return buildStorageNotFound(text);
+            return respondUserError(text);
         }
         const apifyConsoleUrl = buildConsoleKeyValueStoreUrl(
             await getConsoleLinkContext(apifyToken, client),
@@ -84,8 +86,10 @@ export const getKeyValueStoreRecord: ToolEntry = Object.freeze({
         // structuredContent — so emit a minimal schema-conforming descriptor alongside the block.
         // The Console link (Console UI token sessions) rides as a trailing text block.
         if (Buffer.isBuffer(value)) {
-            // Content-Type is case-insensitive; lowercase so the image/audio checks below don't miss `Image/PNG`.
-            const mimeType = contentType?.split(';')[0].trim().toLowerCase();
+            // Normalizes the MIME type (so the image/audio checks below don't miss `Image/PNG`) and
+            // decides inline-vs-link-out at the same MAX_INLINE_BYTES threshold the API-resource proxy uses.
+            const disposition = buildBinaryRecordDisposition(contentType, value);
+            const { mimeType } = disposition;
             const structuredContent = {
                 keyValueStoreId,
                 key: record.key,
@@ -94,40 +98,40 @@ export const getKeyValueStoreRecord: ToolEntry = Object.freeze({
                 summary,
             };
             const consoleLinkContent = buildConsoleLinkContent(apifyConsoleUrl);
-            if (value.length > KV_RECORD_MAX_INLINE_BYTES) {
+            if (disposition.kind === 'linkOut') {
                 // base64-inlining a large binary would blow up the context window; return a link instead.
                 const uri = await store.getRecordPublicUrl(recordKey);
-                return {
+                return respondRaw({
                     structuredContent,
                     content: [
                         {
                             type: 'resource_link',
                             uri,
                             name: recordKey,
-                            size: value.length,
+                            size: disposition.bytes,
                             ...(mimeType && { mimeType }),
                         } satisfies ResourceLink,
                         ...consoleLinkContent,
                     ],
-                };
+                });
             }
-            const data = value.toString('base64');
+            const data = disposition.base64;
             if (mimeType?.startsWith('image/')) {
-                return {
+                return respondRaw({
                     structuredContent,
                     content: [{ type: 'image', data, mimeType } satisfies ImageContent, ...consoleLinkContent],
-                };
+                });
             }
             if (mimeType?.startsWith('audio/')) {
-                return {
+                return respondRaw({
                     structuredContent,
                     content: [{ type: 'audio', data, mimeType } satisfies AudioContent, ...consoleLinkContent],
-                };
+                });
             }
             // The blob is inlined, so the uri is just an identifier — build it from the store's API
             // URL instead of getRecordPublicUrl, which fetches store metadata to sign a link nobody follows.
             const uri = `${store.url}/records/${recordKey}`;
-            return {
+            return respondRaw({
                 structuredContent,
                 content: [
                     {
@@ -136,7 +140,7 @@ export const getKeyValueStoreRecord: ToolEntry = Object.freeze({
                     } satisfies EmbeddedResource,
                     ...consoleLinkContent,
                 ],
-            };
+            });
         }
         // Text/JSON values serialize cleanly — return them as structuredContent per the storage-tool contract.
         // apify-client maps an empty record body to `undefined`, which drops the schema-required `value` on

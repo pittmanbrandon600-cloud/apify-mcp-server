@@ -5,6 +5,43 @@ All pull requests are subject to automated and manual review against these guide
 
 ---
 
+## Before you write code
+
+**Send us the problem, not the patch.**
+
+Generating a patch is cheap; validating the right patch takes maintainer time. A pull request with no agreed problem behind it is a proposal we must reverse-engineer from a diff, so we will close it.
+
+### 1. Open an issue
+
+Use the templates — [bug report](https://github.com/apify/apify-mcp-server/issues/new?template=bug_report.yml) or [feature request](https://github.com/apify/apify-mcp-server/issues/new?template=feature_request.yml) — and include relevant versions, configuration, and logs. They turn a report into a fix.
+
+Two things the form can't enforce:
+
+- **Evidence over adjectives.** "Users are confused" is weak; "3 users hit this on Claude Desktop, log attached" is strong.
+- **Write it yourself.** A pasted agent transcript is not an issue. Trim it to the point first.
+
+### 2. We take it from there
+
+**An open issue is not an invitation to implement it.** Some are unrefined, stale, or parked because the right fix is not settled. We decide what gets built and when — filing a good issue *is* the contribution.
+
+Two exceptions: **documentation fixes** (typos, broken links, wrong commands) go straight to a PR, and **work a maintainer invited you to do** — scope it to that issue and link it with `Closes #123`.
+
+---
+
+## AI-assisted contributions
+
+AI tools are welcome — we use them, and this repo ships [`AGENTS.md`](./AGENTS.md) for them. These rules are about accountability, and they don't replace the issue-first process above.
+
+- **Reviewers talk to you, not your agent.** Answer review comments in your own words.
+- **Disclose AI assistance.** In the issue or PR description, name the tool and what it did. Do not add a model as a co-author.
+- **Show it works.** Include a test, an `mcpc` transcript, a screenshot, or an Actor run. Green CI alone is not enough.
+- **Do not post automated AI review comments** on your PR or other people's.
+- **Verify issues yourself.** Don't file a bug an agent "found" without reproducing it, and never file a speculative security report.
+
+Contributions that ignore this are closed with a link here. Repeated low-effort submissions lead to restricted participation.
+
+---
+
 ## Branch naming
 
 The default branch is `master`. Feature branches must follow the `type/short-description` format, where `type` matches the conventional commit type:
@@ -151,6 +188,17 @@ Use comments to guide reviewers:
 *   **Comments:**
     * Use proper English (spelling, grammar, punctuation, capitalization).
     * Use JSDoc `/**` for documentation, `//` for generic comments, and avoid `/*` (single asterisk multiline comments).
+    * **Comment the *why*, not the *what*.** Good comments explain intent, trade-offs, and non-obvious constraints — never restate what the code already says. Follow these rules:
+        1. **Don't duplicate the code.** Delete comments that narrate the next line (e.g. `// Apply filter if configured` above the `if`, `// Helper to format X` above `formatX`). If the code says it, the comment shouldn't.
+        2. **Don't use comments to excuse unclear code.** Fix the name or the structure instead of explaining a bad one.
+        3. **If you can't write a clear comment, the code is probably the problem.** A comment you struggle to phrase is a signal to simplify the code.
+        4. **Dispel confusion, don't cause it.** A comment that contradicts the code (wrong `@param`, stale example, inverted assertion) is worse than none — keep comments in sync with the code they describe.
+        5. **Explain unidiomatic code.** When code is deliberately unusual (a cast the compiler forces, a workaround for an upstream quirk), say why. This is the comment that earns its place.
+        6. **Link the source of copied/adapted code.** Paste a URL to the original.
+        7. **Link external references where they help.** API endpoints, spec sections, algorithms — link the exact page (e.g. the matching `docs.apify.com/api/v2/...` slug), not a generic one.
+        8. **Comment bug fixes.** When a line exists to fix a bug or work around a defect, note it and link the issue (`// see apify/apify-mcp-server#637`).
+        9. **Mark incomplete work.** Use `TODO`/`FIXME` with concrete context and an issue link where one exists (e.g. `TODO(#675): ...`) — not a vague `// TODO: fix this`.
+    * **No commented-out code.** Delete it; git history is the archive. Don't repeat the same comment across many lines — state it once (file- or block-level) or make the code self-explanatory.
 
 *   **Parameters**
     * **Minimal Parameters:** Pass only the parameters that the function actually uses.

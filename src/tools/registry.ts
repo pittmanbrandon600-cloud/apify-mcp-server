@@ -22,10 +22,10 @@
 import { HELPER_TOOLS, type HelperToolName } from '../const.js';
 import type { ToolEntry } from '../types.js';
 import { SERVER_MODE } from '../types.js';
-import { addActor } from './actors/add_actor.js';
 import { callActorApps, callActorDefault } from './actors/call_actor.js';
 import { fetchActorDetails } from './actors/fetch_actor_details.js';
 import { searchActors } from './actors/search_actors.js';
+import { reportProblem } from './dev/report_problem.js';
 import { fetchApifyDocs } from './docs/fetch_apify_docs.js';
 import { searchApifyDocs } from './docs/search_apify_docs.js';
 import { abortActorRun } from './runs/abort_actor_run.js';
@@ -40,6 +40,11 @@ import { getKeyValueStore } from './storage/get_key_value_store.js';
 import { getKeyValueStoreKeys } from './storage/get_key_value_store_keys.js';
 import { getKeyValueStoreList } from './storage/get_key_value_store_list.js';
 import { getKeyValueStoreRecord } from './storage/get_key_value_store_record.js';
+import { createActorTask } from './tasks/create_actor_task.js';
+import { getActorTask } from './tasks/get_actor_task.js';
+import { publishActorTask } from './tasks/publish_actor_task.js';
+import { unpublishActorTask } from './tasks/unpublish_actor_task.js';
+import { updateActorTask } from './tasks/update_actor_task.js';
 import { callActorWidget } from './widgets/call_actor_widget.js';
 import { fetchActorDetailsWidget } from './widgets/fetch_actor_details_widget.js';
 import { getActorRunWidget } from './widgets/get_actor_run_widget.js';
@@ -64,7 +69,6 @@ function isModeMap(entry: CategoryToolEntry): entry is ModeMap {
  * Use {@link getCategoryTools} to resolve entries into concrete ToolEntry arrays for a given mode.
  */
 export const toolCategories = {
-    experimental: [addActor],
     actors: [
         searchActors,
         fetchActorDetails,
@@ -83,7 +87,8 @@ export const toolCategories = {
         getDatasetList,
         getKeyValueStoreList,
     ],
-    dev: [],
+    tasks: [createActorTask, getActorTask, updateActorTask, publishActorTask, unpublishActorTask],
+    dev: [reportProblem],
 } satisfies Record<string, CategoryToolEntry[]>;
 
 /**

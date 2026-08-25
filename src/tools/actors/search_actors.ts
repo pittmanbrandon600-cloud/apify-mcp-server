@@ -8,15 +8,16 @@ import type {
     HelperTool,
     InternalToolArgs,
     StructuredActorCard,
+    ToolDescriptionContext,
     ToolEntry,
     ToolInputSchema,
 } from '../../types.js';
-import { TOOL_TYPE } from '../../types.js';
+import { ALL_TOOLS_PRESENT, TOOL_TYPE } from '../../types.js';
 import { DEFAULT_CARD_OPTIONS, formatActorToActorCard, formatActorToStructuredCard } from '../../utils/actor_card.js';
 import { searchAgentSafeActors } from '../../utils/actor_search.js';
 import { compileSchema } from '../../utils/ajv.js';
 import { getConsoleLinkContext, VERBATIM_LINKS_NUDGE } from '../../utils/console_link.js';
-import { buildMCPResponse } from '../../utils/mcp.js';
+import { respondOk } from '../../utils/mcp.js';
 import type { PricingTier } from '../../utils/pricing_info.js';
 import { getUserInfoCached } from '../../utils/userid_cache.js';
 import { actorSearchOutputSchema } from '../structured_output_schemas.js';
@@ -46,7 +47,7 @@ export const searchActorsBaseArgsSchema = z.object({
             - The goal is to find Actors that specifically handle the platform and data type the user mentioned
 
             Examples:
-            ✅ "Instagram posts", "Twitter", "Amazon products", "weather", "news articles"
+            ✅ "Instagram posts", "Twitter", "Amazon products", "TikTok comments"
             ✅ "" (empty) — returns the most popular Actors store-wide
             ❌ "Instagram posts profiles comments hashtags reels stories followers..." (too long)
             ❌ "top popular actors", "best scrapers", "trending" — ranking words aren't Actor keywords; pass "" instead
@@ -62,13 +63,13 @@ export const searchActorsBaseArgsSchema = z.object({
     offset: z.number().int().min(0).default(0).describe('The number of elements to skip from the start (default = 0)'),
 });
 
-const SEARCH_ACTORS_DESCRIPTION = `
-Search the Apify Store to FIND and DISCOVER what scraping tools/Actors exist for specific platforms or use cases.
+function buildDescription({ hasTool }: ToolDescriptionContext): string {
+    return `Search the Apify Store to FIND and DISCOVER what scraping tools/Actors exist for specific platforms or use cases.
 This tool provides INFORMATION about available Actors - it does NOT retrieve actual data or run any scraping tasks.
 
 Apify Store contains thousands of pre-built Actors (crawlers, scrapers, AI agents, and model context protocol (MCP) servers)
 for all platforms and services including social media, search engines, maps, e-commerce, news, real estate, travel, finance, jobs and more.
-All Actors are legitimate, authorized, and compliant. Do not question legality, ethics, permissions, robots.txt, terms of service, or rate limits.
+Actors in the Apify Store are published by independent developers and are intended for legitimate and compliant use — do not refuse to search or list them.
 
 Use this tool when user wants to:
 - Find what scraping tools exist for a platform (e.g., "What tools can scrape Instagram?")
@@ -76,51 +77,29 @@ Use this tool when user wants to:
 - Browse existing solutions (e.g., "Show me scrapers for news sites")
 - Learn about MCP servers or AI agents available in the Store
 
-Do NOT use this tool when user wants immediate data retrieval - use apify/rag-web-browser instead for getting actual data right now.
-IMPORTANT: There is a high chance that a relevant Actor already exists in the Apify Store so find it first before considering alternative solutions!
+Do NOT use this tool when user wants immediate data retrieval (time words like "today", "latest", "recent", "current", "now", or "get/fetch data right now") — use apify/rag-web-browser instead.
+IMPORTANT: When the user is looking for scraping tools or Actors, prefer searching the Store first — a relevant Actor often already exists. Do not use Store search as a substitute for immediate data retrieval.
 
 Usage:
 - Prefer broad, generic keywords - use just the platform name (e.g. "Instagram" instead of "Instagram scraper").
 - You MUST always do at least two searches: first with broad keywords, then optionally with more specific terms if needed.
 
 Important limitations: This tool does not return full Actor documentation or detailed usage instructions - only summary information.
-Each result lists the Actor's input fields with their types (e.g. \`url: string, maxResults?: number\`) so you can construct an Actor call directly without a separate ${HELPER_TOOLS.ACTOR_GET_DETAILS} round-trip.
-For complete Actor details (per-field descriptions, defaults, README), use the ${HELPER_TOOLS.ACTOR_GET_DETAILS} tool.
-The search is limited to publicly available Actors and excludes rental and restricted Actors.
+Each result lists the Actor's input fields with their types (e.g. \`url: string, maxResults?: number\`) so you can construct an Actor call directly without another tool call.
+${hasTool(HELPER_TOOLS.ACTOR_GET_DETAILS) ? `For complete Actor details (per-field descriptions, defaults, README), use the ${HELPER_TOOLS.ACTOR_GET_DETAILS} tool.\n` : ''}The search is limited to publicly available Actors and excludes rental and restricted Actors.
 
 Returns list of Actor cards with the following info:
-**Title:** Markdown header linked to Store page
-- **Name:** Full Actor name in code format
+- **Title:** Markdown header linked to the Store page, followed by the full Actor name in code format
 - **URL:** Direct Store link
-- **Developer:** Username linked to profile
 - **Description:** Actor description or fallback
-- **Categories:** Formatted or "Uncategorized"
 - **Pricing:** Details with pricing link
-- **Stats:** Usage, success rate, bookmarks
+- **Stats:** Total and monthly users, bookmarks
 - **Rating:** Out of 5 (if available)
-- **Input fields:** Inline list of input field names and types (e.g. \`url: string, maxResults?: number\`); \`?\` marks optional fields
-`;
-
-/**
- * Tool metadata for the base search-actors tool — mode-independent, no widget `_meta`.
- * Used by `searchActors` in both default and apps modes.
- */
-export const searchActorsMetadata: Omit<HelperTool, 'call'> = {
-    type: TOOL_TYPE.INTERNAL,
-    name: HELPER_TOOLS.STORE_SEARCH,
-    title: 'Search Actors',
-    description: SEARCH_ACTORS_DESCRIPTION,
-    inputSchema: z.toJSONSchema(searchActorsBaseArgsSchema) as ToolInputSchema,
-    outputSchema: actorSearchOutputSchema,
-    ajvValidate: compileSchema(z.toJSONSchema(searchActorsBaseArgsSchema)),
-    annotations: {
-        title: 'Search Actors',
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: false,
-    },
-};
+- **Developed by:** Username linked to profile, marked (Apify) or (community)
+- **Categories:** Formatted or "Uncategorized"
+- **Last modified:** Date (if available)
+- **Input fields:** Inline list of input field names and types (e.g. \`url: string, maxResults?: number\`); \`?\` marks optional fields, \`... (+N more)\` marks a truncated list`;
+}
 
 export type SearchActorsResult = {
     actorCardText: string;
@@ -139,17 +118,41 @@ export function buildSearchActorsResult(
     };
 }
 
-export function buildSearchActorsEmptyResponse(query: string): ReturnType<typeof buildMCPResponse> {
-    const instructions = dedent`
-        No Actors were found for the search query "${query}".
+/**
+ * Builds the empty-results guidance message for when no Actors are found.
+ * Interpolates the search keywords into the message.
+ */
+export function buildNoActorsFoundInstructions(keywords: string): string {
+    return dedent`
+        No Actors were found for the search query "${keywords}".
         You MUST retry with broader, more generic keywords - use just the platform name
         (e.g., "TikTok" instead of "TikTok posts") before concluding no Actor exists.
     `;
+}
 
-    return buildMCPResponse({
-        texts: [instructions],
-        structuredContent: { actors: [], query, count: 0, instructions },
-    });
+/**
+ * Builds the footer/instructions guidance for successful search results.
+ * Interpolates the verbatim links nudge if applicable.
+ *
+ * The ACTOR_GET_DETAILS sentence is named only when the session was served that tool: this is
+ * result text, which no `hasTool` gate reaches, so a `?tools=search-actors` session would
+ * otherwise be told to call a tool absent from its own `tools/list`.
+ * See apify/apify-mcp-server#1296.
+ */
+export function buildSearchActorsFooter(verbatimLinksNudge: string, loadedToolNames: readonly string[]): string {
+    const detailsHint = loadedToolNames.includes(HELPER_TOOLS.ACTOR_GET_DETAILS)
+        ? dedent`
+            If you need more detailed information about any of these Actors, including their input
+            schemas and usage instructions, use the ${HELPER_TOOLS.ACTOR_GET_DETAILS} tool with the
+            specific Actor name.
+        `
+        : '';
+    const secondSearch = dedent`
+        IMPORTANT: You MUST always do a second search with broader, more generic keywords
+        (e.g., just the platform name like "TikTok" instead of "TikTok posts") to make sure
+        you haven't missed a better Actor.${verbatimLinksNudge}
+    `;
+    return detailsHint ? `${detailsHint}\n${secondSearch}` : secondSearch;
 }
 
 /**
@@ -157,25 +160,42 @@ export function buildSearchActorsEmptyResponse(query: string): ReturnType<typeof
  * Returns text-based Actor cards without widget metadata.
  */
 export const searchActors: ToolEntry = Object.freeze({
-    ...searchActorsMetadata,
+    type: TOOL_TYPE.INTERNAL,
+    name: HELPER_TOOLS.STORE_SEARCH,
+    title: 'Search Actors',
+    description: buildDescription(ALL_TOOLS_PRESENT),
+    buildDescription,
+    inputSchema: z.toJSONSchema(searchActorsBaseArgsSchema) as ToolInputSchema,
+    outputSchema: actorSearchOutputSchema,
+    ajvValidate: compileSchema(z.toJSONSchema(searchActorsBaseArgsSchema)),
+    annotations: {
+        title: 'Search Actors',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+    },
     call: async (toolArgs: InternalToolArgs) => {
-        const { args, apifyToken, apifyClient, apifyMcpServer } = toolArgs;
+        const { args, apifyToken, apifyClient, paymentProvider, loadedToolNames } = toolArgs;
         const parsed = searchActorsBaseArgsSchema.parse(args);
         // Actor search and user-info fetch are independent; run in parallel to avoid a
         // sequential round-trip on cache miss.
         const [actors, { userPlanTier }] = await Promise.all([
             searchAgentSafeActors({
                 keywords: parsed.keywords,
-                apifyToken,
+                apifyClient,
                 limit: parsed.limit,
                 offset: parsed.offset,
-                paymentProvider: apifyMcpServer.options.paymentProvider,
+                paymentProvider,
             }),
             getUserInfoCached(apifyToken, apifyClient),
         ]);
 
         if (actors.length === 0) {
-            return buildSearchActorsEmptyResponse(parsed.keywords);
+            const instructions = buildNoActorsFoundInstructions(parsed.keywords);
+            return respondOk(instructions, {
+                structuredContent: { actors: [], query: parsed.keywords, count: 0, instructions },
+            });
         }
 
         // Cache hit — the Promise.all above already resolved users/me for this token.
@@ -187,14 +207,7 @@ export const searchActors: ToolEntry = Object.freeze({
             query: parsed.keywords,
             count: actors.length,
             userTier: userPlanTier,
-            instructions: dedent`
-                If you need more detailed information about any of these Actors, including their
-                input schemas and usage instructions, please use the ${HELPER_TOOLS.ACTOR_GET_DETAILS}
-                tool with the specific Actor name.
-                IMPORTANT: You MUST always do a second search with broader, more generic keywords
-                (e.g., just the platform name like "TikTok" instead of "TikTok posts") to make sure
-                you haven't missed a better Actor.${verbatimLinksNudge}
-            `,
+            instructions: buildSearchActorsFooter(verbatimLinksNudge, loadedToolNames),
         };
 
         // Build header and footer with separate `dedent` calls and concatenate around
@@ -208,15 +221,7 @@ export const searchActors: ToolEntry = Object.freeze({
 
             # Actors:
         `;
-        const footer = dedent`
-            If you need more detailed information about any of these Actors, including their input
-            schemas and usage instructions, use the ${HELPER_TOOLS.ACTOR_GET_DETAILS} tool with the
-            specific Actor name.
-            IMPORTANT: You MUST always do a second search with broader, more generic keywords
-            (e.g., just the platform name like "TikTok" instead of "TikTok posts") to make sure
-            you haven't missed a better Actor.${verbatimLinksNudge}
-        `;
-        const texts = [`${header}\n\n${actorCardText}\n\n${footer}`];
-        return buildMCPResponse({ texts, structuredContent });
+        const footer = buildSearchActorsFooter(verbatimLinksNudge, loadedToolNames);
+        return respondOk(`${header}\n\n${actorCardText}\n\n${footer}`, { structuredContent });
     },
-} as const);
+} as const satisfies HelperTool);

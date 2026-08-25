@@ -62,7 +62,6 @@ describe('buildApifySpecificProperties', () => {
         expect(result.resources.items?.title).toBeDefined();
         expect(result.resources.items?.description).toBeDefined();
 
-        // Check that other properties remain unchanged
         expect(result.otherProp).toEqual(properties.otherProp);
     });
     it('should add key and value structure to array items with editor keyValue', () => {
@@ -90,7 +89,6 @@ describe('buildApifySpecificProperties', () => {
         expect(result.keyValuePairs.items?.properties?.value).toBeDefined();
         expect(result.keyValuePairs.items?.properties?.value.type).toBe('string');
 
-        // Check that other properties remain unchanged
         expect(result.otherProp).toEqual(properties.otherProp);
     });
     it('should add globs structure to array items with editor globs', () => {
@@ -124,7 +122,6 @@ describe('buildApifySpecificProperties', () => {
         expect(result.globs.items?.properties?.headers).toBeDefined();
         expect(result.globs.items?.properties?.headers.type).toBe('object');
 
-        // Check that other properties remain unchanged
         expect(result.otherProp).toEqual(properties.otherProp);
     });
     it('should add pseudoUrls structure to array items with items.editor pseudoUrls', () => {
@@ -158,7 +155,6 @@ describe('buildApifySpecificProperties', () => {
         expect(result.pseudoUrls.items?.properties?.headers).toBeDefined();
         expect(result.pseudoUrls.items?.properties?.headers.type).toBe('object');
 
-        // Check that other properties remain unchanged
         expect(result.otherProp).toEqual(properties.otherProp);
     });
     it('should add useApifyProxy, apifyProxyGroups, and proxyUrls properties to proxy objects', () => {
@@ -198,7 +194,6 @@ describe('buildApifySpecificProperties', () => {
         expect(result.proxy.properties?.proxyUrls.items).toBeDefined();
         expect(result.proxy.properties?.proxyUrls.items?.type).toBe('string');
 
-        // Check that other properties remain unchanged
         expect(result.otherProp).toEqual(properties.otherProp);
     });
 
@@ -225,7 +220,6 @@ describe('buildApifySpecificProperties', () => {
         expect(result.sources.items?.properties?.url).toBeDefined();
         expect(result.sources.items?.properties?.url.type).toBe('string');
 
-        // Check that other properties remain unchanged
         expect(result.otherProp).toEqual(properties.otherProp);
     });
 
@@ -755,20 +749,8 @@ describe('transformActorInputSchemaProperties', () => {
         expect(result.sources.items).toBeDefined();
         expect(result.sources.items?.properties?.url).toBeDefined();
         // 3. filterSchemaProperties: only allowed fields present
-        // NOTE: includes phantom `default: undefined` etc. from filterSchemaProperties (#675).
-        expect(Object.keys(result['foo-dot-bar'])).toEqual(
-            expect.arrayContaining([
-                'title',
-                'description',
-                'type',
-                'default',
-                'prefill',
-                'properties',
-                'items',
-                'required',
-                'enum',
-            ]),
-        );
+        // 'foo.bar' upstream only declares title/description/type — no default, prefill, enum, etc.
+        expect(Object.keys(result['foo-dot-bar']).sort()).toEqual(['description', 'title', 'type']);
         // 4. shortenProperties: longDesc is truncated, enumProp.enum is shortened
         expect(result.longDesc.description.length).toBeLessThanOrEqual(ACTOR_MAX_DESCRIPTION_LENGTH + 3);
         if (result.enumProp.enum) {
@@ -1034,12 +1016,13 @@ describe('buildActorInputSchema + getToolPublicFieldOnly pipeline', () => {
         const pub = getToolPublicFieldOnly(tool, { filterWidgetMeta: false });
         const schema = pub.inputSchema as {
             required?: string[];
-            properties?: Record<string, { description?: string }>;
+            properties?: Record<string, { description?: string; prefill?: unknown }>;
         };
 
         expect(schema.required).toEqual(['query']);
         expect(schema.properties?.query?.description).toMatch(/^\*\*REQUIRED\*\*/);
         expect(schema.properties?.maxResults?.description).not.toMatch(/^\*\*REQUIRED\*\*/);
+        expect(schema.properties?.query?.prefill).toBe('web browser for RAG pipelines');
     });
 });
 
